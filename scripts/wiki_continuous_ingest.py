@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""
+wiki-continuous-ingest.py
+Detects new/modified .md files in the vault and enqueues them to the ARQ worker.
+Runs on the host, accesses local Redis (127.0.0.1:6379) and Qdrant (localhost:6333).
+"""
+import os
+import sys
+import json
+import hashlib
+import asyncio
+from pathlib import Path
+from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+from arq import create_pool
+from arq.connections import RedisSettings
+import redis.asyncio as aioredis
+
+# ─── Config ────────────────────────────────────────────────────────────────
+ENV_PATH = os.environ.get("ENV_PATH", "")
+if ENV_PATH:
+    env_p = Path(ENV_PATH)
+    if env_p.exists():
+        load_dotenv(env_p)
+
+WIKI_ROOT = Path(os.environ.get("WIKI_ROOT", "."))
+STATE_DIR = Path(os.environ.get("HERMES_STATE_DIR", str(Path.home() / ".hermes")))
+STATE_FILE = STATE_DIR / "wiki_ingest_state.json"
+FAILURES_FILE = STATE_DIR / "wiki_ingest_failures.json"
+REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
+
+redis_settings = RedisSettings(
+    host="127.0.0.1",
+    port=6379,
+    password=REDIS_PASSWORD or None,
+)
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_state(state: dict):
+    """Atomic write via tempfile + rename to avoid corruption."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_FILE)
+
+
+def file_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+async def redis_ready() -> bool:
+    """Check whether Redis is accessible before enqueuing."""
+    try:
+        r = aioredis.Redis(
+            host="127.0.0.1", port=6379,
+            password=REDIS_PASSWORD or None,
+            socket_connect_timeout=3,
+            socket_timeout=3,
+        )
+        ok = await r.ping()
+        await r.aclose()
+        return bool(ok)
+    except Exception as e:
+        print(f"  ⚠️  Redis unavailable: {e}")
+        return False
+
+
+async def main():
+    if not await redis_ready():
+        print("❌ Redis not ready. Docker stack may still be starting up. Aborting.")
+        return
+
+    state = load_state()
+    new_files = []
+    modified_files = []
+    skipped = 0
+    total = 0
+
+    # Scan all .md files
+    for path in sorted(WIKI_ROOT.rglob("*.md")):
+        total += 1
+        rel = str(path.relative_to(WIKI_ROOT))
+        mtime = path.stat().st_mtime
+        current_hash = file_hash(path)
+
+        if rel not in state:
+            new_files.append(rel)
+            state[rel] = {"mtime": mtime, "hash": current_hash, "queued_at": None, "ingested_at": None}
+        elif state[rel]["hash"] != current_hash:
+            modified_files.append(rel)
+            state[rel]["mtime"] = mtime
+            state[rel]["hash"] = current_hash
+            state[rel]["queued_at"] = None
+            state[rel]["ingested_at"] = None
+        else:
+            skipped += 1
+
+    files_to_ingest = new_files + modified_files
+
+    if not files_to_ingest:
+        print(f"⏭️  Nothing new. {total} files tracked, {skipped} unchanged.")
+        return
+
+    # Enqueue in ARQ
+    redis = await create_pool(redis_settings)
+    enqueued = 0
+    failed = 0
+    failures = []
+
+    for rel_path in files_to_ingest:
+        abs_path = str(WIKI_ROOT / rel_path)
+        try:
+            job = await redis.enqueue_job(
+                "process_wiki_file",
+                file_path=f"/wiki/{rel_path}",  # path inside container
+            )
+            state[rel_path]["queued_at"] = datetime.now(timezone.utc).isoformat()
+            enqueued += 1
+            print(f"  ✅ Enqueued: {rel_path} (job: {job.job_id[:8]})")
+        except Exception as e:
+            failed += 1
+            error_msg = str(e)
+            # Classify the error for the DLQ
+            error_lower = error_msg.lower()
+            transient_patterns = ["timeout", "connection", "rate limit", "503", "502", "504",
+                                  "unavailable", "too many requests", "refused", "reset"]
+            permanent_patterns = ["400", "404", "not found", "invalid", "parse error",
+                                  "deleted", "permission denied"]
+            failure_class = "unknown"
+            for p in transient_patterns:
+                if p in error_lower:
+                    failure_class = "transient"
+                    break
+            if failure_class == "unknown":
+                for p in permanent_patterns:
+                    if p in error_lower:
+                        failure_class = "permanent"
+                        break
+            
+            failures.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "file": rel_path,
+                "error": error_msg,
+                "failure_class": failure_class,    # NEW: classification
+                "reported": False,                  # NEW: not yet reported
+                "retry_count": 0,                   # NEW: zero retries
+            })
+            print(f"  ⚠️  Failure: {rel_path} — {e} [{failure_class}]")
+
+    await redis.aclose()
+    save_state(state)
+
+    # Persist failures to simple DLQ (atomic, last 500)
+    if failures:
+        FAILURES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        existing = []
+        if FAILURES_FILE.exists():
+            with open(FAILURES_FILE) as f:
+                existing = json.load(f)
+        existing.extend(failures)
+        existing = existing[-500:]
+        tmp = FAILURES_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(existing, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, FAILURES_FILE)
+
+    print(f"\n📊 {total} files tracked")
+    print(f"   New: {len(new_files)} | Modified: {len(modified_files)} | Unchanged: {skipped}")
+    print(f"   Enqueued: {enqueued} | Failures: {failed}")
+    if failures:
+        print(f"   📋 Failures persisted to: {FAILURES_FILE}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
