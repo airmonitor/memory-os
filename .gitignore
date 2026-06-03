@@ -27,3 +27,4 @@ Thumbs.db
 # Python venv
 .venv/
 venv/
+CLAUDE.md

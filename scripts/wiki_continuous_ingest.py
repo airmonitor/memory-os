@@ -31,11 +31,13 @@ FAILURES_FILE = STATE_DIR / "wiki_ingest_failures.json"
 REDIS_HOST = config.valkey.host
 REDIS_PORT = int(config.valkey.port)
 REDIS_PASSWORD = config.valkey.password or ""
+REDIS_DB = int(config.valkey.db)
 
 redis_settings = RedisSettings(
     host=REDIS_HOST,
     port=REDIS_PORT,
     password=REDIS_PASSWORD or None,
+    database=REDIS_DB,
 )
 
 

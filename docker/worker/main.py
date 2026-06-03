@@ -40,6 +40,7 @@ redis_settings = RedisSettings(
     host=valkey.host,
     port=int(valkey.port),
     password=(valkey.password or None),
+    database=int(valkey.db),
 )
 
 

@@ -37,12 +37,14 @@ from scripts.db import get_conn  # noqa: E402
 REDIS_HOST = config.valkey.host
 REDIS_PORT = int(config.valkey.port)
 REDIS_PASSWORD = config.valkey.password or ""
+REDIS_DB = int(config.valkey.db)
 MAX_REFLECTIONS_PER_HOUR = int(config.reflection.max_per_hour)
 
 redis_settings = RedisSettings(
     host=REDIS_HOST,
     port=REDIS_PORT,
     password=REDIS_PASSWORD or None,
+    database=REDIS_DB,
 )
 
 LOG_FILE = Path(config.paths.reflection_log)
@@ -66,6 +68,7 @@ async def is_idle() -> bool:
         r = aioredis.Redis(
             host=REDIS_HOST, port=REDIS_PORT,
             password=REDIS_PASSWORD or None,
+            db=REDIS_DB,
             decode_responses=True,
         )
 
