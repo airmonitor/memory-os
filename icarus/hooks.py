@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import sys
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -11,14 +12,32 @@ from pathlib import Path
 
 from . import state
 
-# ── LLM extraction key ──
-_OPENROUTER_KEY = (
-    os.environ.get("OPENROUTER_FULL_API_KEY", "")
-    or os.environ.get("OPENROUTER_DS_API_KEY", "")
-    or os.environ.get("OPENROUTER_API_KEY", "")
+# ── Service config (config/services.yaml) ─────────────────────────────────
+# Fall back to a local repo when running from a checkout instead of the Hermes
+# plugins dir (e.g. during development).
+try:
+    from memos_config import config as _svc  # type: ignore
+except ImportError:
+    _here = Path(__file__).resolve()
+    for _root in _here.parents:
+        if (_root / "memos_config" / "loader.py").exists():
+            sys.path.insert(0, str(_root))
+            from memos_config import config as _svc  # type: ignore
+            break
+    else:
+        _svc = None  # config absent → fall back to env at call time
+
+# ── LiteLLM extraction config ──
+_LITELLM_KEY = (_svc.litellm.api_key if _svc else os.environ.get("LITELLM_API_KEY", "")) or ""
+_LITELLM_URL = (_svc.litellm.base_url if _svc else os.environ.get("LITELLM_URL", "")).rstrip("/")
+_EXTRACTION_MODEL = (
+    _svc.litellm.models.extraction.name if _svc
+    else os.environ.get("ICARUS_EXTRACTION_MODEL", "lm-studio-qwen3.6")
 )
-_EXTRACTION_MODEL = os.environ.get("ICARUS_EXTRACTION_MODEL", "deepseek/deepseek-v4-flash")
-_EXTRACTION_MAX_TOKENS = int(os.environ.get("ICARUS_EXTRACTION_MAX_TOKENS", "1024"))
+_EXTRACTION_MAX_TOKENS = int(
+    _svc.litellm.models.extraction.max_tokens if _svc
+    else os.environ.get("ICARUS_EXTRACTION_MAX_TOKENS", "4096")
+)
 
 logger = logging.getLogger(__name__)
 
@@ -203,11 +222,8 @@ def _search_qdrant(query, top_k=2, threshold=0.72):
     Returns empty list on any failure (fail-open).
     """
     try:
-        # context_enhancer looks for OPENROUTER_API_KEY (singular);
-        # inject our resolved key into environ for compatibility
-        if _OPENROUTER_KEY and not os.environ.get("OPENROUTER_API_KEY"):
-            os.environ["OPENROUTER_API_KEY"] = _OPENROUTER_KEY
-
+        # context_enhancer now reads LiteLLM creds from config/services.yaml;
+        # no env propagation needed.
         from scripts.context_enhancer import (
             embed_query, embed_query_sparse, search_with_fallback
         )
@@ -669,8 +685,8 @@ def _llm_extract_entries(transcript):
     Returns list of dicts: {type, summary, content, training_value}
     Returns empty list on failure or if nothing worth preserving.
     """
-    if not _OPENROUTER_KEY:
-        logger.warning("icarus: no OpenRouter key — skipping LLM extraction")
+    if not _LITELLM_KEY:
+        logger.warning("icarus: no LiteLLM key — skipping LLM extraction")
         return []
 
     prompt = (
@@ -704,16 +720,11 @@ def _llm_extract_entries(transcript):
     }).encode("utf-8")
 
     try:
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/chat/completions",
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {_OPENROUTER_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://hermes-agent.local",
-                "X-Title": "Icarus Session Extraction"
-            }
-        )
+        url = f"{_LITELLM_URL}/chat/completions" if _LITELLM_URL else "https://litellm.airmonitor.pl/v1/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if _LITELLM_KEY:
+            headers["Authorization"] = f"Bearer {_LITELLM_KEY}"
+        req = urllib.request.Request(url, data=payload, headers=headers)
         resp = urllib.request.urlopen(req, timeout=45)
         body = json.loads(resp.read().decode("utf-8"))
         raw = body["choices"][0]["message"]["content"]

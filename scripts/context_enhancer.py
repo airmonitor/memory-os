@@ -17,7 +17,6 @@ import sys
 import json
 import uuid
 import hashlib
-import sqlite3
 import subprocess
 import requests
 import argparse
@@ -28,29 +27,28 @@ from pathlib import Path
 import time
 from datetime import datetime, timezone
 
-# ─── Config ────────────────────────────────────────────────────────────────
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-if not OPENROUTER_KEY:
-    env_path = Path.home() / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            if line.startswith("OPENROUTER_API_KEY="):
-                OPENROUTER_KEY = line.split("=", 1)[1].strip().strip('"')
-                break
+# ─── Config (single source of truth: config/services.yaml) ─────────────────
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
-COLLECTION = os.environ.get("QDRANT_COLLECTION", "knowledge_base")
+from memos_config import config  # noqa: E402
 
-EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
-TOP_K_DEFAULT = 3
-SCORE_THRESHOLD_DEFAULT = 0.55
-MAX_TEXT_LEN = 8000
-REQUEST_TIMEOUT = 10
+LITELLM_URL = config.litellm.base_url.rstrip("/")
+LITELLM_KEY = config.litellm.api_key or ""
+EMBEDDING_MODEL = config.litellm.models.embedding.name
+EMBEDDING_DIMS = int(config.litellm.models.embedding.dimensions)
 
-# FastEmbed BM25 config
+QDRANT_URL = config.qdrant.url
+COLLECTION = config.qdrant.collection
+
+TOP_K_DEFAULT = int(config.search.top_k)
+SCORE_THRESHOLD_DEFAULT = float(config.search.score_threshold)
+MAX_TEXT_LEN = int(config.search.max_text_len)
+REQUEST_TIMEOUT = int(config.search.request_timeout)
+
+# FastEmbed BM25 config (subprocess venv path — kept env-driven, infra not service)
 FASTEMBED_VENV = os.environ.get("FASTEMBED_VENV", "")
-
-# Default: use current Python if venv not configured
 _FASTEMBED_PYTHON = FASTEMBED_VENV if FASTEMBED_VENV else sys.executable
 _FASTEMBED_SITEPKGS = os.environ.get(
     "FASTEMBED_SITEPKGS",
@@ -58,18 +56,13 @@ _FASTEMBED_SITEPKGS = os.environ.get(
 )
 BM25_MODEL = "Qdrant/bm25"
 
-# Lineage config
-LINEAGE_DB = os.environ.get(
-    "STATE_DB_PATH",
-    os.path.expanduser("~/.hermes/state.db")
-)
-
-# Telemetry config
-TELEMETRY_LOG = os.environ.get(
-    "TELEMETRY_LOG_PATH",
-    os.path.expanduser("~/.hermes/logs/query-telemetry.jsonl")
-)
+# Telemetry config (local file path, not a service)
+TELEMETRY_LOG = config.paths.telemetry_log
 TELEMETRY_MAX_BYTES = 10 * 1024 * 1024  # 10MB rotation
+
+# Postgres connection helper
+from scripts.db import get_conn  # noqa: E402
+from psycopg.types.json import Jsonb  # noqa: E402
 
 # ─── Lineage Registration ───────────────────────────────────────────────────
 
@@ -81,21 +74,21 @@ def register_lineage(
     generation_model: str = "unknown",
 ) -> Optional[str]:
     """
-    Register generation provenance in the lineage DB.
+    Register generation provenance in Postgres (memos.lineage).
     Fail-open: if it fails, log error and return None. Never breaks the critical path.
     """
     lineage_id = str(uuid.uuid4())
     try:
-        with sqlite3.connect(LINEAGE_DB) as conn:
-            conn.execute(
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
                 """
                 INSERT INTO lineage (lineage_id, session_id, query, retrieved_chunk_ids,
-                                     generation_model, generation_context_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                                     generation_model, generation_context_hash)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (lineage_id, session_id, query,
-                 json.dumps(retrieved_chunk_ids, ensure_ascii=False),
-                 generation_model, generation_context_hash)
+                 Jsonb(retrieved_chunk_ids),
+                 generation_model, generation_context_hash),
             )
             conn.commit()
         return lineage_id
@@ -181,24 +174,30 @@ def _strip_prompt_injection(text: str) -> str:
 # ─── Core ───────────────────────────────────────────────────────────────────
 
 def embed_query(text: str) -> Optional[List[float]]:
-    """Generate dense embedding via OpenRouter qwen/qwen3-embedding-8b."""
-    if not OPENROUTER_KEY:
-        return None
+    """Generate dense embedding via LiteLLM (OpenAI-compatible)."""
     try:
+        headers = {"Content-Type": "application/json"}
+        if LITELLM_KEY:
+            headers["Authorization"] = f"Bearer {LITELLM_KEY}"
         resp = requests.post(
-            "https://openrouter.ai/api/v1/embeddings",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "Content-Type": "application/json"
-            },
+            f"{LITELLM_URL}/embeddings",
+            headers=headers,
             json={
                 "model": EMBEDDING_MODEL,
-                "input": text[:MAX_TEXT_LEN]
+                "input": text[:MAX_TEXT_LEN],
+                "dimensions": EMBEDDING_DIMS,
             },
-            timeout=REQUEST_TIMEOUT
+            timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
-        return resp.json()["data"][0]["embedding"]
+        vec = resp.json()["data"][0]["embedding"]
+        if len(vec) != EMBEDDING_DIMS:
+            print(
+                f"[CE-ERROR] Embedding dim mismatch: expected {EMBEDDING_DIMS}, got {len(vec)}",
+                file=sys.stderr,
+            )
+            return None
+        return vec
     except Exception as e:
         # Fail-open: log silently, return None
         print(f"[CE-ERROR] Embedding dense failed: {e}", file=sys.stderr)
@@ -377,54 +376,62 @@ def lexical_search_in_vault(
     return results
 
 
-# ─── Fallback: SQLite Keyword Search ────────────────────────────────────────
+# ─── Fallback: Postgres Keyword Search (FTS over lineage.query_tsv) ─────────
 
 def sqlite_keyword_search(
     query_terms: List[str],
     top_k: int = TOP_K_DEFAULT
 ) -> List[Dict]:
     """
-    Search terms in the lineage table (query field) and other state tables.
-    Last resort — does not replace vault.
+    Search lineage.query via Postgres full-text (tsvector GIN). Name kept for
+    backward compat with callers; underlying store is now Postgres.
+    Last resort — does not replace vault. Fail-open: returns [] on any error.
     """
     if not query_terms:
         return []
 
+    # Build a `plainto_tsquery` from OR'd terms (each term treated as a phrase)
+    ts_query = " | ".join(t.strip() for t in query_terms if t.strip())
+    if not ts_query:
+        return []
+
     try:
-        with sqlite3.connect(LINEAGE_DB) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-
-            results = []
-            # Search in lineage.query
-            placeholders = " OR ".join(["query LIKE ?"] * len(query_terms))
-            params = [f"%{term}%" for term in query_terms]
-            c.execute(
-                f"""
-                SELECT lineage_id, session_id, query, generation_context_hash, created_at
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT lineage_id::text   AS lineage_id,
+                       session_id,
+                       query,
+                       generation_context_hash,
+                       created_at
                 FROM lineage
-                WHERE {placeholders}
+                WHERE query_tsv @@ to_tsquery('simple', %s)
                 ORDER BY created_at DESC
-                LIMIT ?
+                LIMIT %s
                 """,
-                params + [top_k * 2]
+                (ts_query, top_k * 2),
             )
-            for row in c.fetchall():
-                results.append({
-                    "id": f"sqlite-{row['lineage_id'][:16]}",
-                    "score": 0.5,
-                    "title": f"Lineage {row['lineage_id'][:8]}...",
-                    "content_preview": _strip_prompt_injection((row["query"] or "")[:400]),
-                    "source": f"sqlite-history-{row['session_id']}",
-                    "tags": ["fallback", "sqlite"],
-                    "fallback_level": "sqlite",
-                })
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
 
-            if results:
-                print(f"[CE-FALLBACK] SQLite keyword search returned {len(results)} results", file=sys.stderr)
-            return results[:top_k]
+        results = []
+        for row in rows:
+            r = dict(zip(cols, row))
+            results.append({
+                "id": f"pg-{r['lineage_id'][:16]}",
+                "score": 0.5,
+                "title": f"Lineage {r['lineage_id'][:8]}...",
+                "content_preview": _strip_prompt_injection((r["query"] or "")[:400]),
+                "source": f"pg-history-{r['session_id']}",
+                "tags": ["fallback", "postgres"],
+                "fallback_level": "postgres",
+            })
+
+        if results:
+            print(f"[CE-FALLBACK] Postgres keyword search returned {len(results)} results", file=sys.stderr)
+        return results[:top_k]
     except Exception as e:
-        print(f"[CE-FALLBACK] SQLite search failed: {e}", file=sys.stderr)
+        print(f"[CE-FALLBACK] Postgres search failed: {e}", file=sys.stderr)
         return []
 
 

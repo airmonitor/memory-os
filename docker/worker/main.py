@@ -1,50 +1,51 @@
 """
 Cognitive Worker ARQ — Memory-as-a-Service (MaaS)
-Main entry point for the processing worker.
+Main entry point for the processing worker. Reads service configuration from
+config/services.yaml via the memos_config loader.
 """
-import asyncio
 import logging
-import os
+import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+# ─── Make memos_config importable (container: /app, dev: repo root) ─────────
+_here = Path(__file__).resolve()
+for _candidate in (_here.parent, *_here.parents):
+    if (_candidate / "memos_config" / "loader.py").exists():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
 
-# ─── Load .env ──────────────────────────────────────────────────────────────
-ENV_PATH = Path(__file__).parent.parent / ".env"
-if ENV_PATH.exists():
-    load_dotenv(ENV_PATH)
+from memos_config import config  # noqa: E402
 
 # ─── Logging configuration ──────────────────────────────────────────────────
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+LOG_LEVEL = config.logging.level if hasattr(config, "logging") else "INFO"
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper()),
+    level=getattr(logging, str(LOG_LEVEL).upper()),
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("cognitive-worker")
 
-# ─── Import ARQ worker ──────────────────────────────────────────────────────
-from arq import create_pool, cron
-from arq.connections import RedisSettings
+# ─── ARQ + Redis (Valkey) ───────────────────────────────────────────────────
+from arq import cron  # noqa: E402
+from arq.connections import RedisSettings  # noqa: E402
 
-from tasks.ingestion import ingest_memory
-from tasks.reflection import reflect_on_memories, micro_reflection
-from tasks.file_ingestion import ingest_file
+from tasks.ingestion import ingest_memory  # noqa: E402
+from tasks.reflection import reflect_on_memories, micro_reflection  # noqa: E402
+from tasks.file_ingestion import ingest_file  # noqa: E402
+from services.db import get_pool, close_pool  # noqa: E402
 
-# ─── Redis configuration ────────────────────────────────────────────────────
-REDIS_HOST = os.environ.get("REDIS_HOST", "redis-maas")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
-
+valkey = config.valkey
 redis_settings = RedisSettings(
-    host=REDIS_HOST,
-    port=REDIS_PORT,
-    password=REDIS_PASSWORD or None,
+    host=valkey.host,
+    port=int(valkey.port),
+    password=(valkey.password or None),
 )
+
 
 # ─── Startup/shutdown functions ────────────────────────────────────────────
 async def startup(ctx):
-    """Connect to Qdrant and validate the collection."""
+    """Connect to Qdrant + Postgres pool. Validate the Qdrant collection."""
     from services.local_qdrant import get_qdrant_client, ensure_collection
 
     logger.info("Worker starting...")
@@ -52,10 +53,8 @@ async def startup(ctx):
     await ensure_collection(ctx["qdrant"])
     logger.info("Qdrant connection validated")
 
-
-async def process_wiki_file(ctx, file_path: str):
-    """ARQ job: ingests a .md file from the vault."""
-    return await ingest_file(ctx["qdrant"], file_path)
+    ctx["pg"] = await get_pool()
+    logger.info("Postgres pool ready")
 
 
 async def shutdown(ctx):
@@ -63,21 +62,27 @@ async def shutdown(ctx):
     logger.info("Worker shutting down...")
     if "qdrant" in ctx:
         await ctx["qdrant"].close()
+    await close_pool()
 
 
 # ─── ARQ function definitions ────────────────────────────────────────────
 async def process_ingestion(ctx, memory_text: str, source: str, tags: list = None):
-    """ARQ job: ingests a memory into the vector store."""
+    """ARQ job: ingest a memory into the vector store."""
     return await ingest_memory(ctx["qdrant"], memory_text, source, tags)
 
 
+async def process_wiki_file(ctx, file_path: str):
+    """ARQ job: ingest a .md file from the vault."""
+    return await ingest_file(ctx["qdrant"], file_path)
+
+
 async def process_reflection(ctx):
-    """ARQ job: runs periodic reflection."""
+    """ARQ job: run periodic reflection."""
     return await reflect_on_memories(ctx["qdrant"])
 
 
 async def process_micro_reflection(ctx):
-    """ARQ job: runs on-demand micro-reflection (Phase 3)."""
+    """ARQ job: run on-demand micro-reflection (Phase 3)."""
     return await micro_reflection(ctx["qdrant"])
 
 
@@ -88,9 +93,9 @@ class WorkerSettings:
     functions = [process_ingestion, process_reflection, process_micro_reflection, process_wiki_file]
     on_startup = startup
     on_shutdown = shutdown
-    max_jobs = int(os.environ.get("ARQ_MAX_JOBS", "10"))
-    job_timeout = int(os.environ.get("ARQ_JOB_TIMEOUT", "300"))
-    keep_result = int(os.environ.get("ARQ_KEEP_RESULT", "3600"))
+    max_jobs = int(config.valkey.arq.max_jobs)
+    job_timeout = int(config.valkey.arq.job_timeout)
+    keep_result = int(config.valkey.arq.keep_result)
     cron_jobs = [
         # Reflection every 2 hours (minute 0 of even hours)
         cron(process_reflection, hour={0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22}, minute=0),
@@ -100,10 +105,7 @@ class WorkerSettings:
 
 # ─── Entry point ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
-
     if len(sys.argv) > 1 and sys.argv[1] == "--run-worker":
-        # Start ARQ worker (concurrency via max_jobs, not multi-process)
         import subprocess
         logger.info("Starting ARQ worker...")
         subprocess.run(["arq", "main.WorkerSettings"])

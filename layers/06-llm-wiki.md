@@ -55,13 +55,13 @@ They're independent: the Wiki Agent builds the curated knowledge graph; Continuo
    a. Scans $VAULT_PATH/wiki/ for *.md files
    b. Computes SHA-256 hash for each file
    c. Compares with state file
-   d. New or modified → enqueues ARQ job in Redis
+   d. New or modified → enqueues ARQ job in Valkey/Redis
 3. ARQ Worker (Docker):
    a. process_wiki_file → reads file content
    b. parse_frontmatter → extracts metadata
-   c. get_embedding() → Qwen3-Embedding-8B (4096d)
+   c. get_embedding() → LiteLLM (config.litellm.models.embedding.name, 4096d)
    d. get_sparse_embedding() → BM25 (fastembed, local)
-   e. upsert_with_dedup() → Qdrant knowledge_base
+   e. upsert_with_dedup() → Qdrant collection (config.qdrant.collection)
 ```
 
 **State file:** JSON file tracking `{file_path, sha256_hash, ingested_at}` for each indexed file. Prevents re-ingestion of unchanged files.

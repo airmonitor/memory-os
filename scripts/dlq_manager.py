@@ -13,14 +13,22 @@ import sys
 import json
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Dict, Optional
 from dataclasses import dataclass, asdict, field
 from collections import Counter
 
-# ─── Config ────────────────────────────────────────────────────────────────
-DLQ_PATH = os.environ.get("HERMES_DLQ_PATH", os.path.expanduser("~/.hermes/wiki_ingest_failures.json"))
-REPORT_LOG = os.environ.get("HERMES_DLQ_REPORT_LOG", os.path.expanduser("~/.hermes/cron/output/dlq_reports.jsonl"))
-REPORT_DIR = os.environ.get("HERMES_DLQ_REPORT_DIR", os.path.expanduser("~/.hermes/cron/output/quality_report"))
+# ─── Config (config/services.yaml) ──────────────────────────────────────────
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from memos_config import config  # noqa: E402
+
+_HERMES_HOME = Path(config.paths.hermes_home)
+DLQ_PATH = os.environ.get("HERMES_DLQ_PATH", str(_HERMES_HOME / "wiki_ingest_failures.json"))
+REPORT_LOG = os.environ.get("HERMES_DLQ_REPORT_LOG", str(_HERMES_HOME / "cron" / "output" / "dlq_reports.jsonl"))
+REPORT_DIR = os.environ.get("HERMES_DLQ_REPORT_DIR", str(_HERMES_HOME / "cron" / "output" / "quality_report"))
 MAX_REPORT_HISTORY = 100  # entries in JSONL
 
 # ─── Data Model ─────────────────────────────────────────────────────────────

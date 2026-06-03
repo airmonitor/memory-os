@@ -8,7 +8,10 @@ __pycache__/
 .env
 .env.local
 
-# Docker
+# Local config override
+config/services.local.yaml
+
+# Docker (legacy local volumes — services now on NAS)
 docker/qdrant_data/
 docker/redis_data/
 
@@ -20,3 +23,7 @@ docker/redis_data/
 # OS
 .DS_Store
 Thumbs.db
+
+# Python venv
+.venv/
+venv/

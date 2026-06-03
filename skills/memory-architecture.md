@@ -40,8 +40,10 @@ The collection uses **named vectors** — required by Qdrant 1.17+ for hybrid se
 
 ### Creating the collection
 
+In normal operation the ARQ worker calls `ensure_collection()` on first start, so this is rarely needed by hand. Manual command (substitute `$QDRANT_URL` and `$QDRANT_COLLECTION` from `config/services.yaml`):
+
 ```bash
-curl -s -X PUT http://localhost:6333/collections/knowledge_base \
+curl -s -X PUT $QDRANT_URL/collections/$QDRANT_COLLECTION \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": {
@@ -57,22 +59,21 @@ curl -s -X PUT http://localhost:6333/collections/knowledge_base \
 
 | Step | Component | Details |
 |------|-----------|---------|
-| Dense embedding | Qwen3-Embedding-8B via OpenRouter | 4096 dimensions, 32K context, $0.01/1M tokens |
+| Dense embedding | LiteLLM-brokered model (default `rapid-mlx-qwen3-embedding-8b` → Qwen3-Embedding-8B) | 4096 dims, 32K context |
 | Sparse embedding | FastEmbed BM25 (local) | Runs in-process, no API call |
-| Queue | Redis (ARQ) | Async job queue for ingestion |
+| Queue | Valkey / Redis (ARQ) | Async job queue for ingestion |
 | Worker | Docker (ARQ Worker) | Processes embedding + Qdrant upsert |
 
-### Environment alignment checklist
+### Configuration alignment checklist
 
-Three places must agree on `EMBEDDING_DIMS`:
+Two places must agree on the embedding dimensions:
 
-1. `.env` → `EMBEDDING_DIMS=4096`
-2. `embedding.py` default → `4096`
-3. Qdrant collection `vectors.dense.size` → `4096`
+1. `config/services.yaml` → `litellm.models.embedding.dimensions: 4096`
+2. Qdrant collection `vectors.dense.size` → `4096`
 
-If they mismatch, OpenRouter truncates via Matryoshka (if you pass `dimensions: 1024`) or Qdrant rejects vectors silently. Always verify all three after any config change.
+The worker validates this on every embedding call (`docker/worker/services/embedding.py`) and raises if `len(vec) != dimensions`. Switching models is a YAML edit + collection rebuild.
 
-**Batch embeddings aggressively.** OpenRouter's `/v1/embeddings` endpoint accepts arrays. Sending 50 texts per request (instead of 1) reduces total time from ~4 hours to ~30-40 minutes for 30K items.
+**Batch embeddings aggressively.** OpenAI-compatible `/v1/embeddings` endpoints accept arrays. Sending 50 texts per request (instead of 1) reduces total time from ~4 hours to ~30-40 minutes for 30K items.
 
 **Falsification experiment before scale.** Embed a pilot of 50-100 items, index them, verify search works, confirm payload structure, THEN scale.
 
@@ -84,14 +85,14 @@ Every query goes through this cascade until one succeeds:
 1. Hybrid: dense (4096d cosine) + sparse (BM25) → RRF fusion
 2. Dense-only: if sparse fails → pure vector search
 3. Lexical: if Qdrant offline → markdown file search in vault
-4. SQLite: if vault inaccessible → keyword search in lineage table
+4. Postgres FTS: if vault inaccessible → tsvector @@ to_tsquery over lineage.query
 5. None: all exhausted → return empty (fail-open)
 ```
 
 **Search via REST API (Qdrant 1.17):**
 
 ```bash
-curl -s -X POST http://localhost:6333/collections/knowledge_base/points/search \
+curl -s -X POST $QDRANT_URL/collections/$QDRANT_COLLECTION/points/search \
   -H "Content-Type: application/json" \
   -d '{
     "vector": {"name": "dense", "vector": [0.0156, ...]},

@@ -27,11 +27,17 @@ import requests
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ─── Config ────────────────────────────────────────────────────────────────
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
-COLLECTION = os.environ.get("QDRANT_COLLECTION", "knowledge_base")
+# ─── Config (config/services.yaml) ──────────────────────────────────────────
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from memos_config import config  # noqa: E402
+
+QDRANT_URL = config.qdrant.url
+COLLECTION = config.qdrant.collection
 SCROLL_LIMIT = 100  # Qdrant pagination
-LOG_DIR = Path(os.environ.get("HERMES_LOGS_DIR", str(Path.home() / ".hermes" / "logs")))
+LOG_DIR = Path(os.environ.get("HERMES_LOGS_DIR", str(Path(config.paths.hermes_home) / "logs")))
 LOG_FILE = LOG_DIR / "decay_scanner.log"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────

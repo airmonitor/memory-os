@@ -12,27 +12,29 @@ import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
 
-from dotenv import load_dotenv
 from arq import create_pool
 from arq.connections import RedisSettings
 import redis.asyncio as aioredis
 
-# ─── Config ────────────────────────────────────────────────────────────────
-ENV_PATH = os.environ.get("ENV_PATH", "")
-if ENV_PATH:
-    env_p = Path(ENV_PATH)
-    if env_p.exists():
-        load_dotenv(env_p)
+# ─── Config (config/services.yaml) ──────────────────────────────────────────
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
-WIKI_ROOT = Path(os.environ.get("WIKI_ROOT", "."))
-STATE_DIR = Path(os.environ.get("HERMES_STATE_DIR", str(Path.home() / ".hermes")))
+from memos_config import config  # noqa: E402
+
+WIKI_ROOT = Path(os.environ.get("WIKI_ROOT", str(config.paths.wiki_root)))
+STATE_DIR = Path(os.environ.get("HERMES_STATE_DIR", str(config.paths.hermes_home)))
 STATE_FILE = STATE_DIR / "wiki_ingest_state.json"
 FAILURES_FILE = STATE_DIR / "wiki_ingest_failures.json"
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
+
+REDIS_HOST = config.valkey.host
+REDIS_PORT = int(config.valkey.port)
+REDIS_PASSWORD = config.valkey.password or ""
 
 redis_settings = RedisSettings(
-    host="127.0.0.1",
-    port=6379,
+    host=REDIS_HOST,
+    port=REDIS_PORT,
     password=REDIS_PASSWORD or None,
 )
 
@@ -60,10 +62,10 @@ def file_hash(path: Path) -> str:
 
 
 async def redis_ready() -> bool:
-    """Check whether Redis is accessible before enqueuing."""
+    """Check whether Redis/Valkey is accessible before enqueuing."""
     try:
         r = aioredis.Redis(
-            host="127.0.0.1", port=6379,
+            host=REDIS_HOST, port=REDIS_PORT,
             password=REDIS_PASSWORD or None,
             socket_connect_timeout=3,
             socket_timeout=3,

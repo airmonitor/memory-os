@@ -1,48 +1,50 @@
 """
-Embedding client. Provider-agnostic — defaults to OpenRouter, configurable
-via EMBEDDING_API_BASE and EMBEDDING_MODEL for local Ollama/vLLM/llama.cpp.
-Mandatory dimension validation.
+Embedding client. Talks to LiteLLM (OpenAI-compatible). Reads endpoint, key,
+model, and expected dimensions from config/services.yaml.
 """
-import os
+from __future__ import annotations
+
 import logging
+import sys
+from pathlib import Path
 
 import httpx
 
-logger = logging.getLogger("cognitive-worker.embedding")
+_here = Path(__file__).resolve()
+for _candidate in (_here.parent, *_here.parents):
+    if (_candidate / "memos_config" / "loader.py").exists():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-EMBEDDING_DIMS = int(os.environ.get("EMBEDDING_DIMS", "4096"))
-EMBEDDING_API_BASE = os.environ.get(
-    "EMBEDDING_API_BASE", "https://openrouter.ai/api/v1"
-)
-EMBEDDING_MODEL = os.environ.get(
-    "EMBEDDING_MODEL", "qwen/qwen3-embedding-8b"
-)
+from memos_config import config  # noqa: E402
+
+logger = logging.getLogger("cognitive-worker.embedding")
 
 
 async def get_embedding(text: str) -> list[float]:
     """
-    Generates embedding via the configured backend.
-    Validates that the returned dimensions match EMBEDDING_DIMS.
+    Generate embedding via LiteLLM. Validates returned dimensions against
+    config.litellm.models.embedding.dimensions.
     """
-    headers = {"Content-Type": "application/json"}
+    base_url = config.litellm.base_url.rstrip("/")
+    api_key = config.litellm.api_key or ""
+    model = config.litellm.models.embedding.name
+    expected_dims = int(config.litellm.models.embedding.dimensions)
 
-    if "openrouter" in EMBEDDING_API_BASE.lower():
-        if not OPENROUTER_API_KEY:
-            raise RuntimeError("OPENROUTER_API_KEY is required for OpenRouter")
-        headers["Authorization"] = f"Bearer {OPENROUTER_API_KEY}"
-        headers["HTTP-Referer"] = "https://localhost"
-        headers["X-Title"] = "Cognitive-Agent-MaaS"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     payload = {
-        "model": EMBEDDING_MODEL,
+        "model": model,
         "input": text,
-        "dimensions": EMBEDDING_DIMS,  # OpenAI/OpenRouter-specific; ignored by Ollama/vLLM
+        "dimensions": expected_dims,  # OpenAI-style; local servers may ignore
     }
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
-            f"{EMBEDDING_API_BASE}/embeddings",
+            f"{base_url}/embeddings",
             headers=headers,
             json=payload,
         )
@@ -51,12 +53,10 @@ async def get_embedding(text: str) -> list[float]:
 
     vec = data["data"][0]["embedding"]
 
-    # ─── Critical dimension validation ──────────────────────────────────────
-    if len(vec) != EMBEDDING_DIMS:
+    if len(vec) != expected_dims:
         raise ValueError(
-            f"Embedding dimension mismatch: "
-            f"expected {EMBEDDING_DIMS}, got {len(vec)}. "
-            f"Check EMBEDDING_DIMS in .env and the Qdrant collection."
+            f"Embedding dimension mismatch: expected {expected_dims}, got {len(vec)}. "
+            f"Check config.litellm.models.embedding.dimensions and Qdrant collection schema."
         )
 
     logger.debug(f"Embedding generated: {len(vec)} dims")

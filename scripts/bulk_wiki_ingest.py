@@ -16,24 +16,27 @@ from collections import Counter
 import aiohttp
 import asyncio
 
-# ─── Config ────────────────────────────────────────────────────────────────
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
-COLLECTION = os.environ.get("QDRANT_COLLECTION", os.environ.get("COLLECTION_NAME", "knowledge_base"))
-WIKI_ROOT = Path(os.environ.get("WIKI_ROOT", "."))
-EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
-EMBEDDING_DIMS = 4096
-MAX_TEXT_LEN = 8000      # truncate text for embedding (model context limit)
+# ─── Config (config/services.yaml) ──────────────────────────────────────────
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from memos_config import config  # noqa: E402
+
+LITELLM_URL = config.litellm.base_url.rstrip("/")
+LITELLM_KEY = config.litellm.api_key or ""
+EMBEDDING_MODEL = config.litellm.models.embedding.name
+EMBEDDING_DIMS = int(config.litellm.models.embedding.dimensions)
+QDRANT_URL = config.qdrant.url
+COLLECTION = config.qdrant.collection
+WIKI_ROOT = Path(os.environ.get("WIKI_ROOT", str(config.paths.wiki_root)))
+MAX_TEXT_LEN = int(config.search.max_text_len)
 BATCH_SIZE = 8           # parallel embedding requests
 RATE_LIMIT_SLEEP = 0.5   # seconds between batches
 
-if not OPENROUTER_KEY:
-    print("❌ OPENROUTER_API_KEY not found in environment")
-    sys.exit(1)
-
 print(f"📁 Wiki root: {WIKI_ROOT}")
 print(f"🎯 Collection: {COLLECTION}")
-print(f"🔑 OpenRouter: configured")
+print(f"🔑 LiteLLM: {LITELLM_URL}")
 
 # ─── Find all .md files ───────────────────────────────────────────────────
 md_files = sorted(WIKI_ROOT.rglob("*.md"))
@@ -70,19 +73,19 @@ def get_tags_from_frontmatter(meta: dict) -> list[str]:
     return tags if isinstance(tags, list) else []
 
 async def get_embedding(session: aiohttp.ClientSession, text: str) -> list[float] | None:
-    """Generate embedding via OpenRouter."""
+    """Generate embedding via LiteLLM."""
     payload = {
         "model": EMBEDDING_MODEL,
         "input": text[:MAX_TEXT_LEN],
         "dimensions": EMBEDDING_DIMS,
     }
+    headers = {"Content-Type": "application/json"}
+    if LITELLM_KEY:
+        headers["Authorization"] = f"Bearer {LITELLM_KEY}"
     try:
         async with session.post(
-            "https://openrouter.ai/api/v1/embeddings",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "Content-Type": "application/json",
-            },
+            f"{LITELLM_URL}/embeddings",
+            headers=headers,
             json=payload,
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:

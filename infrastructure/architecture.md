@@ -1,119 +1,155 @@
 # Infrastructure
 
-> Docker services, cronjobs, and environment configuration that support the 6 memory layers.
+> External services (Postgres, Valkey, Qdrant), the local ARQ worker, the cron jobs, and the configuration layer that holds the stack together.
 
-## Docker Services
+## Configuration
 
-The vector and pipeline layers run as Docker containers:
+All hosts/ports/model names live in a single YAML file. Secrets stay in `.env`. The loader interpolates `${ENV_VAR}` placeholders at startup.
 
-```yaml
-# docker-compose.yml
-services:
-  qdrant:
-    image: qdrant/qdrant:v1.17.1
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - ./qdrant_data:/qdrant/storage
-    restart: unless-stopped
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    command: redis-server --requirepass ${REDIS_PASSWORD}
-    restart: unless-stopped
-
-  worker:
-    build: ./worker
-    depends_on:
-      - qdrant
-      - redis
-    environment:
-      - QDRANT_URL=http://qdrant:6333
-      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
-      - EMBEDDING_DIMS=${EMBEDDING_DIMS:-4096}
-      - COLLECTION_NAME=${COLLECTION_NAME:-knowledge_base}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-    restart: unless-stopped
+```
+config/services.yaml        committed   → hosts, ports, model names
+config/services.local.yaml  gitignored  → deep-merged dev/prod override
+.env                        gitignored  → secrets (passwords, API keys)
 ```
 
-**Key configuration:**
-- `EMBEDDING_DIMS=4096` — must match Qdrant collection schema
-- `COLLECTION_NAME=knowledge_base` — target collection for all wiki ingestion
-- Redis password required — set in `.env`, used by both Redis container and worker
+Every script and the worker import the same loader:
 
-## Cronjobs
+```python
+from memos_config import config
+config.postgres.host            # → "192.168.1.134"
+config.valkey.port              # → 6389
+config.qdrant.collection        # → "knowledge_base"
+config.litellm.models.chat.name # → "lm-studio-qwen3.6"
+```
+
+Nothing reads service hosts/ports/model IDs via `os.environ.get(...)` directly — single source of truth. Sanity-check resolution any time with:
+
+```bash
+python -m memos_config
+```
+
+## External services
+
+Postgres, Valkey/Redis, and Qdrant are not provisioned by `docker compose`. They are expected to be reachable at the hosts declared in `config/services.yaml`. They can live on a NAS, a remote VM, or `localhost`.
+
+| Service | Role | Default in `services.yaml` |
+|---|---|---|
+| **Postgres 14+** | `lineage` (FTS via tsvector GIN) + `reflection_budget` (hourly counter). DDL in `scripts/init_schema.sql`. | `192.168.1.134:5432/memos` |
+| **Valkey 7+** (or Redis 7+) | ARQ broker — embedding/ingestion/reflection jobs. | `192.168.1.134:6389` |
+| **Qdrant 1.17+** | `knowledge_base` collection — dense 4096d Cosine + sparse BM25 IDF. Created automatically by the worker on first start. | `192.168.1.135:6333` |
+| **LiteLLM proxy** | OpenAI-compatible embed + chat. Brokers to local MLX / OpenRouter / Anthropic / Ollama / etc. | `https://litellm.airmonitor.pl/v1` |
+
+## Docker (worker-only)
+
+Only the ARQ worker lives in `docker compose`. The build context is the repo root so that `memos_config/` and `config/` are baked into the image.
+
+```yaml
+# docker/docker-compose.yml
+services:
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/worker/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      CONFIG_PATH: /app/config/services.yaml
+      WIKI_PATH: /wiki
+    volumes:
+      - ${WIKI_PATH:-./wiki}:/wiki:ro
+      - ${HERMES_HOME:-~/.hermes}:/hermes:rw
+```
+
+```bash
+cd docker
+docker compose up -d --build worker
+docker compose logs -f worker
+```
+
+Expected startup logs:
+
+```
+Starting ARQ worker...
+Starting worker for 5 functions: process_ingestion, process_reflection, process_micro_reflection, process_wiki_file, cron:process_reflection
+Worker starting...
+Connected to Qdrant at <qdrant-host>:6333
+Creating collection knowledge_base with dense=4096 dims + sparse BM25    # first run only
+Qdrant connection validated
+Postgres pool ready: <pg-host>:5432/memos (min=1 max=4)
+```
+
+## Cron jobs
+
+All cron scripts read the same `config/services.yaml`. They need no extra env wiring beyond `.env` secrets.
 
 | Job | Recommended schedule | What it does |
 |-----|---------------------|--------------|
-| **wiki-continuous-ingest** | Hourly (:00) | SHA-256 diff detection → embed new wiki files → Qdrant |
-| **wiki-raw-ingest-monitor** | 2x/week | Read raw/ files → extract concepts/entities/comparisons → create wiki pages |
-| **vault-curator-weekly** | Weekly | Phase 1 (frontmatter enrichment) + Phase 2 (semantic linking) + Phase 3 (INDEX.md) |
+| **wiki-continuous-ingest** | Hourly (:00) | SHA-256 diff detection → enqueues ARQ jobs to Valkey |
+| **wiki-raw-ingest-monitor** | 2x/week | Read raw/ files → extract concepts/entities/comparisons → wiki pages |
+| **vault-curator-weekly** | Weekly | Frontmatter enrichment + semantic linking + INDEX.md |
 | **decay-scanner** | Weekly | Archive low-importance, aged AI content from Qdrant |
 | **dlq-auto-report** | Every 6h | Dead letter queue monitoring and reporting |
+| **reflection-trigger** | Every 5m | Idle detection + budget gate → enqueues `process_micro_reflection` |
 | **maas-heartbeat** | Every 6h | Infrastructure health check |
-| **holographic-memory-backup** | Weekly | Backup of workspace memory files and databases |
-| **monitor-openrouter-balance** | Daily | OpenRouter credit balance check |
+| **holographic-memory-backup** | Weekly | Backup workspace memory files + SQLite DBs + Postgres dump |
+| **monitor-credit-balance** | Daily | Credit/quota check for the LLM provider behind LiteLLM |
 
-**Interaction between jobs:**
-- `wiki-raw-ingest-monitor` creates new wiki pages → next `wiki-continuous-ingest` picks them up and sends to Qdrant
-- `vault-curator-weekly` enriches ALL vault files — adds frontmatter, semantic links, and INDEX.md
+**Interactions:**
+- `wiki-raw-ingest-monitor` creates wiki pages → next `wiki-continuous-ingest` picks them up and enqueues them via Valkey
+- `vault-curator-weekly` enriches all vault files (frontmatter, semantic links, INDEX.md)
+- `reflection_trigger.py` UPSERTs `reflection_budget` in Postgres — the **same row** the Docker worker writes; this is the cross-process write hotspot that motivated the SQLite → Postgres migration
 
-## Environment Variables
+## Environment variables
+
+`config/services.yaml` references env vars with `${NAME:default}` syntax. The only values required in `.env`:
 
 ### Required
 
 | Variable | Purpose | Example |
 |----------|---------|---------|
-| `FABRIC_DIR` | Where Icarus writes fabric entries | `/home/your-user/vault/fabric` |
-| `OPENROUTER_API_KEY` | Embedding + LLM extraction | `sk-or-...` |
-| `REDIS_PASSWORD` | Redis authentication | (generated) |
+| `POSTGRES_USER_PASSWORD` | Postgres auth | `s3cret!` |
+| `LITELLM_API_KEY` | LiteLLM proxy auth | `sk-...` |
+| `FABRIC_DIR` | Where Icarus writes fabric entries (absolute path; systemd does not expand `~`) | `/home/your-user/vault/fabric` |
 
-### Strongly recommended
+### Optional (override `services.yaml` defaults)
 
-| Variable | Default | Recommended | Why |
-|----------|---------|-------------|-----|
-| `ICARUS_EXTRACTION_MAX_TOKENS` | 1024 | **4096** | 1024 causes fabric truncation |
-| `ICARUS_EXTRACTION_MODEL` | deepseek-v4-flash | same | Any OpenRouter chat model works |
-| `EMBEDDING_DIMS` | varies | **4096** | Must match Qdrant collection schema |
-
-### Optional
-
-| Variable | Purpose |
-|----------|---------|
-| `ICARUS_OBSIDIAN=1` | Enable Obsidian wikilinks and daily notes |
-| `OBSIDIAN_VAULT_PATH` | Vault root (if fabric is a subfolder) |
-| `ICARUS_RESULT_MAX_CHARS` | Fallback truncation limit (default 500) |
-| `ICARUS_TASK_MAX_CHARS` | Fallback task truncation (default 300) |
-| `TOGETHER_API_KEY` | For training/eval tools |
-| `OPENROUTER_FULL_API_KEY` | Alternative key for LLM extraction |
-| `OPENROUTER_DS_API_KEY` | Alternative key for LLM extraction |
-| `CURATOR_LOG_LEVEL` | Logging level for Vault Curator |
-| `VAULT_PATH` | Path to vault root for Vault Curator |
+| Variable | Used in YAML as | Default |
+|----------|-----------------|---------|
+| `POSTGRES_IP`, `POSTGRES_PORT`, `POSTGRES_USER_NAME`, `POSTGRES_DB` | postgres section | `192.168.1.134:5432`, `postgres`, `memos` |
+| `VALKEY_IP`, `VALKEY_PORT`, `VALKEY_PASSWORD` | valkey section | `192.168.1.134:6389`, empty |
+| `QDRANT_URL`, `QDRANT_HOST`, `QDRANT_PORT`, `QDRANT_API_KEY`, `QDRANT_COLLECTION` | qdrant section | `192.168.1.135:6333`, empty, `knowledge_base` |
+| `LITELLM_URL` | litellm.base_url | `https://litellm.airmonitor.pl/v1` |
+| `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_CONTEXT_LENGTH` | embedding model | `rapid-mlx-qwen3-embedding-8b`, 4096, 32768 |
+| `CHAT_MODEL`, `EXTRACTION_MODEL`, `ICARUS_EXTRACTION_MAX_TOKENS` | chat / extraction models | `lm-studio-qwen3.6`, 4096 |
+| `CONFIG_PATH` | absolute override for the YAML location | `/repo/config/services.yaml` |
+| `HERMES_HOME`, `STATE_DB_PATH`, `MEMORY_STORE_DB`, `VAULT_PATH`, `WIKI_ROOT`, `TELEMETRY_LOG_PATH`, `REFLECTION_LOG_PATH` | paths section | `~/.hermes/...` |
 
 ## File locations
 
 | Component | Path |
 |-----------|------|
-| Workspace memory | `$HERMES_HOME/memories/` |
-| Session DB | `$HERMES_HOME/state.db` |
-| Fact store DB | `$HERMES_HOME/memory_store.db` |
+| Workspace memory (Layer 1) | `$HERMES_HOME/memories/` |
+| Session DB (Layer 2, Hermes-owned) | `$HERMES_HOME/state.db` |
+| Fact store DB (Layer 3, Hermes-owned) | `$HERMES_HOME/memory_store.db` |
+| Memory OS tables (Layer 5 fallback + budget) | Postgres `memos` database |
 | Icarus plugin | `$HERMES_HOME/plugins/icarus/` |
-| Fabric entries | `$FABRIC_DIR` |
-| Wiki files | `$VAULT_PATH/wiki/` |
-| Qdrant data | `./qdrant_data/` (Docker volume) |
-| Docker compose | Project root |
-| Cron scripts | Project scripts directory |
+| Fabric entries (Layer 4) | `$FABRIC_DIR` |
+| Wiki files (Layer 6) | `$VAULT_PATH/wiki/` |
+| Qdrant data | NAS / Qdrant host volume |
+| Docker compose | `docker/docker-compose.yml` |
+| Cron scripts | `scripts/` |
 
 ## System requirements
 
 | Resource | Minimum | Recommended |
 |----------|---------|-------------|
-| RAM | 8 GB | 16 GB (Qdrant + Redis + ARQ worker) |
-| Disk | 20 GB | 50 GB (Qdrant vectors + wiki files) |
+| Worker host RAM | 4 GB | 8 GB |
+| NAS / Qdrant host RAM | 8 GB | 16 GB (depends on vector count) |
+| Worker host disk | 5 GB | 20 GB |
 | Docker | 24.0+ | Latest stable |
 | Python | 3.11+ | 3.11 (tested) |
 | Hermes Agent | 0.14.0+ | 0.15.2 (tested) |
+| Postgres | 14+ | 16 (tested) |
+| Valkey / Redis | 7+ | 7.2 (tested) |
 | Qdrant | 1.17+ | 1.17.1 (tested) |

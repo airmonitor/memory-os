@@ -31,15 +31,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
-# ─── Config ────────────────────────────────────────────────────────────────
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
-COLLECTION = os.environ.get("QDRANT_COLLECTION", "knowledge_base")
+# ─── Config (config/services.yaml) ──────────────────────────────────────────
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from memos_config import config  # noqa: E402
+
+QDRANT_URL = config.qdrant.url
+COLLECTION = config.qdrant.collection
 SCROLL_LIMIT = 50  # Qdrant pagination (avoids timeout on large collections)
 SIMILARITY_THRESHOLD = 0.92
 TOP_NEIGHBORS = 10
 
 LOG_DIR = Path(
-    os.environ.get("HERMES_LOG_DIR", str(Path.home() / ".hermes" / "logs"))
+    os.environ.get("HERMES_LOG_DIR", str(Path(config.paths.hermes_home) / "logs"))
 )
 LOG_FILE = LOG_DIR / "semantic_dedup.log"
 REPORT_FILE = LOG_DIR / "semantic_dedup_report.json"

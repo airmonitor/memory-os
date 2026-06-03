@@ -73,24 +73,37 @@ Per-source dedup:
 
 ## Configuration
 
-```bash
-# Required
-FABRIC_DIR=/absolute/path/to/fabric
-OPENROUTER_API_KEY=sk-or-...
+Service hosts/models live in `config/services.yaml`; secrets in `.env`.
 
-# Strongly recommended
+```bash
+# .env
+FABRIC_DIR=/absolute/path/to/fabric
+LITELLM_API_KEY=sk-...
+
+# Optional overrides (see config/services.yaml for defaults)
+EXTRACTION_MODEL=lm-studio-qwen3.6
 ICARUS_EXTRACTION_MAX_TOKENS=4096
-ICARUS_EXTRACTION_MODEL=deepseek/deepseek-v4-flash
 
 # Optional (for Obsidian integration)
 ICARUS_OBSIDIAN=1
 OBSIDIAN_VAULT_PATH=/absolute/path/to/vault
 ```
 
+```yaml
+# config/services.yaml
+litellm:
+  base_url: https://litellm.airmonitor.pl/v1
+  api_key: ${LITELLM_API_KEY}
+  models:
+    extraction:
+      name: ${EXTRACTION_MODEL:lm-studio-qwen3.6}
+      max_tokens: ${ICARUS_EXTRACTION_MAX_TOKENS:4096}
+```
+
 ## Pitfalls
 
-- **`ICARUS_EXTRACTION_MAX_TOKENS` is frozen at import time** — changing `.env` requires gateway restart
-- **DeepSeek + `response_format: json_object` = `content: null`** — the fork uses prompt-based JSON + `_parse_json_robust()` instead
+- **Config is loaded once at import time** — changing `config/services.yaml` or `.env` requires gateway restart (or `reload_config()` in interactive use)
+- **`response_format: json_object` may produce `content: null`** depending on the model behind LiteLLM — the fork uses prompt-based JSON + `_parse_json_robust()` instead
 - **`FABRIC_DIR` must be absolute path** — systemd does not expand `~`
 - **Obsidian is optional** — Icarus writes plain markdown, Obsidian just reads it
 - **Gateway restart required** after editing `hooks.py` or changing env vars

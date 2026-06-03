@@ -15,7 +15,6 @@ Exit codes:
 Fail-open: if OpenRouter or Qdrant is offline, allows execution with a warning.
 """
 
-import os
 import sys
 import json
 import re
@@ -23,29 +22,28 @@ import requests
 from typing import List, Dict, Optional
 from pathlib import Path
 
-# ─── Config ────────────────────────────────────────────────────────────────
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
-COLLECTION = os.environ.get("QDRANT_COLLECTION", "knowledge_base")
-if not OPENROUTER_KEY:
-    _env_path = os.environ.get("ENV_PATH", "")
-    if _env_path:
-        _env = Path(_env_path)
-    else:
-        _env = Path.home() / ".env"
-    if _env.exists():
-        for ln in _env.read_text().splitlines():
-            if ln.startswith("OPENROUTER_API_KEY="):
-                OPENROUTER_KEY = ln.split("=", 1)[1].strip().strip('"')
-                break
-EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
+# ─── Config (config/services.yaml) ──────────────────────────────────────────
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from memos_config import config  # noqa: E402
+
+LITELLM_URL = config.litellm.base_url.rstrip("/")
+LITELLM_KEY = config.litellm.api_key or ""
+EMBEDDING_MODEL = config.litellm.models.embedding.name
+EMBEDDING_DIMS = int(config.litellm.models.embedding.dimensions)
+
+QDRANT_URL = config.qdrant.url
+COLLECTION = config.qdrant.collection
+
 TOP_K = 5
 SCORE_THRESHOLD = 0.60
 WARN_THRESHOLD = 0.75          # pure wiki docs need a higher score for a warning
 BLOCK_SEVERITIES = {"critical", "high"}
 WARN_SEVERITIES  = {"medium"}
 RULE_SOURCES = {"reflection", "decision", "rule", "pitfall", "insight"}
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = int(config.search.request_timeout)
 
 # ─── Restriction Patterns in wiki text ─────────────────────────────────────
 RESTRICTION_KEYWORDS = [
@@ -88,17 +86,20 @@ def infer_domain_tags(description: str) -> List[str]:
 # ─── Core ───────────────────────────────────────────────────────────────────
 
 def embed_text(text: str) -> Optional[List[float]]:
-    if not OPENROUTER_KEY:
-        return None
+    """Generate embedding via LiteLLM. Fail-open: return None on any error."""
     try:
+        headers = {"Content-Type": "application/json"}
+        if LITELLM_KEY:
+            headers["Authorization"] = f"Bearer {LITELLM_KEY}"
         r = requests.post(
-            "https://openrouter.ai/api/v1/embeddings",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "Content-Type": "application/json"
+            f"{LITELLM_URL}/embeddings",
+            headers=headers,
+            json={
+                "model": EMBEDDING_MODEL,
+                "input": text[:8000],
+                "dimensions": EMBEDDING_DIMS,
             },
-            json={"model": EMBEDDING_MODEL, "input": text[:8000]},
-            timeout=REQUEST_TIMEOUT
+            timeout=REQUEST_TIMEOUT,
         )
         r.raise_for_status()
         return r.json()["data"][0]["embedding"]

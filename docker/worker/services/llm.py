@@ -1,46 +1,52 @@
 """
-LLM client via native Ollama.
+Chat LLM client via LiteLLM (`/chat/completions`, OpenAI-compatible).
+
+Replaces the previous direct-Ollama (`/api/generate`) implementation. Callers
+in tasks/reflection.py still invoke `ollama_chat()` — the name is kept for
+backward compatibility with import sites.
 """
-import os
+from __future__ import annotations
+
 import logging
+import sys
+from pathlib import Path
 
 import httpx
 
+_here = Path(__file__).resolve()
+for _candidate in (_here.parent, *_here.parents):
+    if (_candidate / "memos_config" / "loader.py").exists():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
+
+from memos_config import config  # noqa: E402
+
 logger = logging.getLogger("cognitive-worker.llm")
-
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-v4-flash:cloud")
-OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
-
-
-def get_auth_header() -> dict:
-    """Returns auth header if API key is configured."""
-    if OLLAMA_API_KEY:
-        return {"Authorization": f"Bearer {OLLAMA_API_KEY}"}
-    return {}
 
 
 async def ollama_chat(prompt: str, model: str | None = None, timeout: int = 120) -> str:
-    """
-    Sends a prompt to native Ollama and returns the response.
-    Uses cloud models like deepseek-v4-flash:cloud.
-    """
-    model = model or OLLAMA_MODEL
-    url = f"{OLLAMA_BASE_URL}/api/generate"
+    """Send a prompt to LiteLLM and return the response content.
 
-    headers = {
-        "Content-Type": "application/json",
-        **get_auth_header(),
-    }
+    `model` arg overrides config.litellm.models.chat.name (used by callers that
+    want to address a specific tier, e.g. reflection vs extraction).
+    """
+    base_url = config.litellm.base_url.rstrip("/")
+    api_key = config.litellm.api_key or ""
+    chat = config.litellm.models.chat
+    model_id = model or chat.name
+
+    url = f"{base_url}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     payload = {
-        "model": model,
-        "prompt": prompt,
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": float(chat.temperature),
+        "max_tokens": int(chat.max_tokens),
         "stream": False,
-        "options": {
-            "temperature": 0.7,
-            "num_predict": 4096,  # DeepSeek generates long reasoning; needs space
-        },
     }
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -48,10 +54,8 @@ async def ollama_chat(prompt: str, model: str | None = None, timeout: int = 120)
         resp.raise_for_status()
         data = resp.json()
 
-    # DeepSeek v4 flash: reasoning can consume tokens, leaving response empty
-    # Return reasoning if content is empty
-    response = data.get("response", "")
-    if not response and "reasoning" in data:
-        response = data["reasoning"]
-    
-    return response
+    try:
+        return data["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError) as e:
+        logger.warning(f"Unexpected LiteLLM response shape: {e}; payload={data}")
+        return ""

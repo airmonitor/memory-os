@@ -2,18 +2,28 @@
 Tasks — episodic memory ingestion.
 """
 import logging
-import os
+import sys
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import PointStruct
 
 from services.embedding import get_embedding
 
+_here = Path(__file__).resolve()
+for _candidate in (_here.parent, *_here.parents):
+    if (_candidate / "memos_config" / "loader.py").exists():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
+
+from memos_config import config  # noqa: E402
+
 logger = logging.getLogger("cognitive-worker.ingestion")
 
-COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "knowledge_base")
+COLLECTION_NAME = config.qdrant.collection
 
 
 async def ingest_memory(

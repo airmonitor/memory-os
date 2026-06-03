@@ -44,13 +44,19 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
-COLLECTION = os.environ.get("QDRANT_COLLECTION", os.environ.get("COLLECTION_NAME", "knowledge_base"))
+# ─── Config (config/services.yaml) ──────────────────────────────────────────
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from memos_config import config  # noqa: E402
+
+QDRANT_URL = config.qdrant.url
+COLLECTION = config.qdrant.collection
 BATCH_SIZE = 200
 SCROLL_LIMIT = 200
-LOG_FILE = Path(os.environ.get("HERMES_LOGS_DIR", str(Path.home() / ".hermes" / "logs"))) / "decay_scanner.log"
-VAULT_ROOT = Path(os.environ.get("VAULT_PATH", "."))
+LOG_FILE = Path(os.environ.get("HERMES_LOGS_DIR", str(Path(config.paths.hermes_home) / "logs"))) / "decay_scanner.log"
+VAULT_ROOT = Path(config.paths.vault)
 
 # ─── Heuristics ──────────────────────────────────────────────────────────────
 CONFIDENCE_BY_SOURCE = {

@@ -5,3 +5,4 @@ arq>=0.28.0
 python-dotenv>=1.0.0
 pyyaml>=6.0
 qdrant-client>=1.17.0
+psycopg[binary]>=3.2

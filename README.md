@@ -32,8 +32,8 @@ Not just another plugin. A complete **memory operating system** — 7 layers wor
 
 Designed and refined by someone who ran headfirst into every limitation of stock Hermes and every existing memory solution.
 
-**Requirements:** Hermes Agent + Docker (Qdrant + Redis + ARQ Worker) + Python 3.11+.  
-Compatible with any LLM provider Hermes supports — OpenRouter, OpenAI, Anthropic, Ollama, and more.
+**Requirements:** Hermes Agent + Docker (ARQ Worker) + Python 3.11+ + reachable Postgres, Valkey/Redis, and Qdrant. Postgres/Valkey/Qdrant can live on a NAS, a remote VM, or `localhost` — all hosts are declared in a single `config/services.yaml`.
+LLM access goes through a LiteLLM proxy (or any OpenAI-compatible endpoint). Compatible with any model that LiteLLM can broker — local MLX, vLLM, Ollama, OpenAI, Anthropic, OpenRouter, etc.
 
 ---
 
@@ -61,8 +61,8 @@ Compatible with any LLM provider Hermes supports — OpenRouter, OpenAI, Anthrop
 ├──────────────────────────────────────────────────────────────────┤
 │  LAYER 5 · VECTOR DATABASE                                        │
 │  Qdrant (4096d Cosine + BM25 sparse)                              │
-│  → 4-level fallback: hybrid → dense → lexical → SQLite            │
-│  → Weekly decay scanner + semantic dedup (cosine >0.92 → merge)  │
+│  → 4-level fallback: hybrid → dense → lexical → Postgres FTS      │
+│  → Weekly decay scanner + semantic dedup (cosine >0.92 → merge)   │
 ├──────────────────────────────────────────────────────────────────┤
 │  LAYER 6 · LLM WIKI                                               │
 │  Auto-curated vault: concepts/ · entities/ · comparisons/         │
@@ -86,6 +86,21 @@ Compatible with any LLM provider Hermes supports — OpenRouter, OpenAI, Anthrop
 Each source is gated by relevance thresholds. Per-session deduplication prevents the same context from appearing twice. A social-closer filter skips trivial messages entirely. No padding. No firehose. The LLM gets exactly what it needs — nothing more.
 
 ---
+
+## Service topology
+
+External services live behind a single config file (`config/services.yaml`); the kept-in-SQLite layers are Hermes-owned and stay local.
+
+| Store | Where | Owns | Why it lives there |
+|---|---|---|---|
+| `state.db` (sessions, messages, FTS5) | local SQLite | Hermes Gateway | Single-writer per file. Stays local. |
+| `memory_store.db` (facts, FTS5) | local SQLite | Hermes Gateway | Same as above. |
+| `lineage`, `reflection_budget` | **Postgres** (`memos`) | Memory OS | Cross-process writers (host cron + Docker worker). Migrated off SQLite to eliminate concurrent-writer corruption. |
+| Vector store | **Qdrant** | Memory OS | Dense 4096d Cosine + sparse BM25. Wiki / sessions / reflections. |
+| Job queue | **Valkey** (Redis-compatible) | Memory OS | ARQ broker for embed/ingest/reflection jobs. |
+| LLM access (embed + chat) | **LiteLLM proxy** | Memory OS | OpenAI-compatible — points at any model (local MLX, OpenRouter, Anthropic, etc.). |
+
+All host/port/model values come from `config/services.yaml`. Secrets (passwords, API keys) come from `.env`. Code never reads service hosts directly via `os.environ.get(...)` — single source of truth.
 
 ## Why Layer 7 is the most important layer
 
@@ -116,7 +131,7 @@ The result: **memory-zero behavior** despite perfect injection. Every rediscover
 | Knowledge pipeline | Not present | Self-curating LLM Wiki |
 | **Ground Truth hierarchy** | **Not present** | **Injected memory ranked as authoritative; agent must use context provided** |
 | Token efficiency | — | Surgical: gated retrieval + per-session dedup + no wasted rediscovery |
-| Infrastructure | — | Local memory stack (Qdrant + Redis + ARQ) + any LLM provider |
+| Infrastructure | — | Postgres (lineage / budget) + Qdrant + Valkey + ARQ Worker, all driven by `config/services.yaml`. LLM via LiteLLM (provider-agnostic). |
 
 ---
 
@@ -126,9 +141,9 @@ Because almost every modern memory solution is **cloud-first**. If you want real
 
 | | Memory OS | mem0 | Zep | Letta |
 |---|---|---|---|---|
-| Local memory infrastructure | ✓ | ✗ | ✗ | ✗ |
+| Self-hosted memory infrastructure (LAN/NAS) | ✓ | ✗ | ✗ | ✗ |
 | No memory subscription | ✓ | ✗ | ✗ | ✗ |
-| Provider agnostic (OpenRouter, Ollama…) | ✓ | Partial | Partial | Partial |
+| Provider agnostic (LiteLLM → MLX/Ollama/OpenRouter…) | ✓ | Partial | Partial | Partial |
 | Hermes-native | ✓ | ✗ | ✗ | ✗ |
 | Structured facts + trust scores | ✓ | Partial | ✗ | ✗ |
 | Self-curating wiki | ✓ | ✗ | ✗ | ✗ |

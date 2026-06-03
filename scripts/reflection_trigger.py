@@ -15,7 +15,6 @@ Usage (cron):
   */5 * * * * $VENV_DIR/bin/python $PROJECT_DIR/scripts/reflection_trigger.py >> $HERMES_LOG_DIR/reflection_trigger.cron.log 2>&1
 """
 
-import os
 import sys
 import json
 import asyncio
@@ -23,20 +22,22 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dotenv import load_dotenv
 from arq import create_pool
 from arq.connections import RedisSettings
 import redis.asyncio as aioredis
 
-# ─── Config ────────────────────────────────────────────────────────────────
-ENV_PATH = Path(os.environ.get("MAA_ENV_PATH", "."))
-if ENV_PATH.exists():
-    load_dotenv(ENV_PATH)
+# ─── Config (config/services.yaml) ──────────────────────────────────────────
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
-REDIS_HOST = os.environ.get("REDIS_HOST", "127.0.0.1")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
-MAX_REFLECTIONS_PER_HOUR = int(os.environ.get("MICRO_REFLECTION_MAX_PER_HOUR", "5"))
+from memos_config import config  # noqa: E402
+from scripts.db import get_conn  # noqa: E402
+
+REDIS_HOST = config.valkey.host
+REDIS_PORT = int(config.valkey.port)
+REDIS_PASSWORD = config.valkey.password or ""
+MAX_REFLECTIONS_PER_HOUR = int(config.reflection.max_per_hour)
 
 redis_settings = RedisSettings(
     host=REDIS_HOST,
@@ -44,12 +45,7 @@ redis_settings = RedisSettings(
     password=REDIS_PASSWORD or None,
 )
 
-LOG_FILE = Path(
-    os.environ.get(
-        "REFLECTION_LOG_PATH",
-        str(Path.home() / ".hermes" / "logs" / "reflection_trigger.log")
-    )
-)
+LOG_FILE = Path(config.paths.reflection_log)
 
 
 def log_message(msg: str):
@@ -75,7 +71,7 @@ async def is_idle() -> bool:
 
         # ARQ stores jobs in queues like 'arq:queue:default'
         queue_names = ["arq:queue:default"]
-        qr_prefix = os.environ.get("ARQ_QUEUE_PREFIX", "arq:queue:")
+        qr_prefix = config.valkey.arq.queue_prefix
         if qr_prefix:
             try:
                 found = await r.keys(f"{qr_prefix}*")
@@ -107,22 +103,16 @@ async def is_idle() -> bool:
 
 
 async def check_budget() -> tuple[bool, int, int]:
-    """Return (allowed, used, max) based on the hourly counter in SQLite."""
+    """Return (allowed, used, max) based on the hourly counter in Postgres."""
     try:
-        import sqlite3
-        db_path = Path(
-            os.environ.get(
-                "STATE_DB_PATH",
-                str(Path.home() / ".hermes" / "state.db")
-            )
-        )
         hour_window = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
-        conn = sqlite3.connect(str(db_path))
-        c = conn.cursor()
-        c.execute("SELECT count FROM reflection_budget WHERE hour_window = ?", (hour_window,))
-        row = c.fetchone()
-        used = row[0] if row else 0
-        conn.close()
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT count FROM reflection_budget WHERE hour_window = %s",
+                (hour_window,),
+            )
+            row = cur.fetchone()
+            used = row[0] if row else 0
         return (used < MAX_REFLECTIONS_PER_HOUR, used, MAX_REFLECTIONS_PER_HOUR)
     except Exception as e:
         log_message(f"Error checking budget: {e}")
@@ -130,26 +120,21 @@ async def check_budget() -> tuple[bool, int, int]:
 
 
 def increment_budget():
-    """Increment the reflection counter in SQLite."""
+    """Increment the reflection counter in Postgres."""
     try:
-        import sqlite3
-        db_path = Path(
-            os.environ.get(
-                "STATE_DB_PATH",
-                str(Path.home() / ".hermes" / "state.db")
-            )
-        )
         hour_window = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
-        conn = sqlite3.connect(str(db_path))
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO reflection_budget (hour_window, count, tokens_used)
-            VALUES (?, 1, 0)
-            ON CONFLICT(hour_window)
-            DO UPDATE SET count = count + 1
-        """, (hour_window,))
-        conn.commit()
-        conn.close()
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO reflection_budget (hour_window, count, tokens_used)
+                VALUES (%s, 1, 0)
+                ON CONFLICT (hour_window) DO UPDATE
+                SET count = reflection_budget.count + 1,
+                    updated_at = now()
+                """,
+                (hour_window,),
+            )
+            conn.commit()
     except Exception as e:
         log_message(f"Error incrementing budget: {e}")
 

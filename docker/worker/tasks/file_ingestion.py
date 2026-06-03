@@ -5,6 +5,7 @@ extracts frontmatter, generates DENSE + BM25 SPARSE embeddings, upserts into kno
 """
 import logging
 import os
+import sys
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
@@ -16,13 +17,22 @@ from qdrant_client.models import PointStruct
 from services.embedding import get_embedding
 from services.sparse_embedding import get_sparse_embedding
 
+_here = Path(__file__).resolve()
+for _candidate in (_here.parent, *_here.parents):
+    if (_candidate / "memos_config" / "loader.py").exists():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
+
+from memos_config import config  # noqa: E402
+
 logger = logging.getLogger("cognitive-worker.file_ingest")
 
-COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "knowledge_base")
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "qdrant-maas")
-QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
-WIKI_PATH = os.environ.get("WIKI_PATH", "/wiki")
-MAX_TEXT_LEN = 8000
+COLLECTION_NAME = config.qdrant.collection
+QDRANT_HOST = config.qdrant.host
+QDRANT_PORT = int(config.qdrant.port)
+WIKI_PATH = os.environ.get("WIKI_PATH", "/wiki")  # container mount path; not a service
+MAX_TEXT_LEN = int(config.search.max_text_len)
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:

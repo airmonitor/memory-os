@@ -1,0 +1,16 @@
+# Example local override file. Copy to services.local.yaml (gitignored) and edit.
+# Deep-merged on top of services.yaml. Useful for dev/prod differences.
+#
+# Example: point to a different Postgres instance for local dev:
+#
+# postgres:
+#   host: 127.0.0.1
+#   port: 5433
+#
+# Example: override embedding model:
+#
+# litellm:
+#   models:
+#     embedding:
+#       name: text-embedding-3-small
+#       dimensions: 1536

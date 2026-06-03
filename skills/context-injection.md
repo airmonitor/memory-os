@@ -42,8 +42,8 @@ System prompt assembled with injected context
 |--------|--------|-----------|-------|------|-------|
 | **Fabric** | `fabric_recall(query)` | overlap > 0.85 → skip | 3 | low (local markdown) | `[fabric]` |
 | **Qdrant** | `_search_qdrant(query)` → context_enhancer | threshold ≥ 0.55 | 2 | high (API embedding) | `[qdrant]` |
-| **Sessions** | FTS5 on state.db | tokens ≥ 4 chars | 2 | low (local SQLite) | `[sessions]` |
-| **Facts** | FTS5 on memory_store.db | first turn only | 3 | low (local SQLite) | `[facts]` |
+| **Sessions** | FTS5 on state.db (Hermes-owned, local SQLite) | tokens ≥ 4 chars | 2 | low | `[sessions]` |
+| **Facts** | FTS5 on memory_store.db (Hermes-owned, local SQLite) | first turn only | 3 | low | `[facts]` |
 
 ### Threshold tuning rationale
 
@@ -87,11 +87,11 @@ search_with_fallback(query, top_k=2, threshold=0.55):
     2. try hybrid (dense + BM25 sparse) → RRF fusion
     3. except -> try dense-only
     4. except -> try lexical (markdown grep)
-    5. except -> try SQLite keyword
+    5. except -> try Postgres FTS (tsvector @@ to_tsquery over lineage.query)
     6. fail -> return empty
 ```
 
-**Key injection pitfall:** `context_enhancer.py` reads `OPENROUTER_API_KEY` (singular) from `os.environ`, but some environments use split keys (`OPENROUTER_FULL_API_KEY`, `OPENROUTER_DS_API_KEY`). Before importing, inject: `os.environ["OPENROUTER_API_KEY"] = resolved_key`. Without this, `embed_query()` fails silently and search falls back to lexical-only.
+**Auth:** `context_enhancer.py` reads `config.litellm.api_key` from `config/services.yaml` (resolved from `${LITELLM_API_KEY}` in `.env`). The Icarus hook reads the same singleton — no per-process env propagation needed. If `embed_query()` fails (LiteLLM unreachable or key missing), the cascade falls through to lexical and then Postgres FTS.
 
 ## Injecting into System Prompt
 
@@ -119,8 +119,8 @@ Source labeling lets the agent understand where each piece of information came f
 
 ### No context being injected
 - Check `_is_social_close()` — trivial messages skip search
-- Verify `OPENROUTER_API_KEY` is resolvable at import time (hooks.py reads at module level)
-- Check gateway was restarted after any `.env` or `hooks.py` changes
+- `python -m memos_config` should print a fully-resolved config (no `${...}` placeholders) and a non-empty `litellm.api_key`
+- Check gateway was restarted after any `.env`, `services.yaml`, or `hooks.py` changes
 - Verify the overlap threshold is 0.85 (not 0.6)
 
 ### Duplicate context appearing
@@ -128,9 +128,9 @@ Source labeling lets the agent understand where each piece of information came f
 - Verify `_injected_*` sets are reset in `on_session_start`
 
 ### Qdrant search returning empty but Qdrant has data
-- Check embedding dimension mismatch (env vs collection)
+- Check embedding dimension mismatch — `config.litellm.models.embedding.dimensions` vs Qdrant collection schema
 - Check if threshold is too high (> 0.55 hides legitimate matches)
-- Check if `OPENROUTER_API_KEY` was injected before context_enhancer import
+- Check `config.litellm.api_key` (resolved from `${LITELLM_API_KEY}`) — if missing, `embed_query()` returns `None` and the cascade falls through to lexical
 
 ### Fabric results stale or missing
 - Verify `fabric_recall` is working (`fabric_brief()` shows entries)

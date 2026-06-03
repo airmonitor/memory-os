@@ -271,12 +271,12 @@ Both profiles write to the same `FABRIC_DIR`, so the reviewer sees the coder's w
 
 ## Fallback models
 
-After switching to a replacement model, set the original as fallback in `config.yaml`:
+After switching to a replacement model, set the original as fallback in Hermes' `config.yaml` (any provider Hermes supports — OpenRouter, OpenAI, Anthropic, LiteLLM, Ollama, etc.):
 
 ```yaml
 model: user/my-agent-v2-abc123
 fallback_model:
-  provider: openrouter
+  provider: openrouter        # or: openai, anthropic, litellm, ollama, ...
   model: anthropic/claude-sonnet-4
 ```
 

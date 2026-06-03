@@ -4,9 +4,10 @@ Reviews old memories, generates insights, CREATES NEW INDEXABLE POINTS in Qdrant
 """
 import logging
 import json
-import os
+import sys
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import PointStruct, Filter, FieldCondition, Range
@@ -16,10 +17,20 @@ import qdrant_client.models as qmodels
 
 from services.llm import ollama_chat
 from services.embedding import get_embedding
+from services.db import get_pool
+
+_here = Path(__file__).resolve()
+for _candidate in (_here.parent, *_here.parents):
+    if (_candidate / "memos_config" / "loader.py").exists():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
+
+from memos_config import config  # noqa: E402
 
 logger = logging.getLogger("cognitive-worker.reflection")
 
-COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "knowledge_base")
+COLLECTION_NAME = config.qdrant.collection
 REFLECTION_PROMPT = """
 You are a cognitive memory assistant. Analyze the provided memories and extract:
 1. Recurring patterns
@@ -157,43 +168,41 @@ Respond in JSON:
 }}
 """
 
-import sqlite3
-import os
 from typing import Optional
 
-STATE_DB_PATH = os.environ.get("STATE_DB_PATH", "/hermes/state.db")
 
-
-def get_budget_for_hour(hour_window: str) -> int:
+async def get_budget_for_hour(hour_window: str) -> int:
     """Returns how many micro-reflections have run in this hour window."""
     try:
-        conn = sqlite3.connect(STATE_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT count FROM reflection_budget WHERE hour_window = ?",
-            (hour_window,),
-        )
-        row = cursor.fetchone()
-        conn.close()
-        return row[0] if row else 0
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT count FROM reflection_budget WHERE hour_window = $1",
+                hour_window,
+            )
+        return row["count"] if row else 0
     except Exception as e:
         logger.warning(f"Error checking budget: {e}")
         return 0  # fail-open: if can't check, allow through
 
 
-def increment_budget(hour_window: str, tokens_used: int = 0):
+async def increment_budget(hour_window: str, tokens_used: int = 0) -> None:
     """Increments the reflection counter for the current hour."""
     try:
-        conn = sqlite3.connect(STATE_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO reflection_budget (hour_window, count, tokens_used)
-            VALUES (?, 1, ?)
-            ON CONFLICT(hour_window)
-            DO UPDATE SET count = count + 1, tokens_used = tokens_used + ?
-        """, (hour_window, tokens_used, tokens_used))
-        conn.commit()
-        conn.close()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO reflection_budget (hour_window, count, tokens_used)
+                VALUES ($1, 1, $2)
+                ON CONFLICT (hour_window) DO UPDATE
+                SET count = reflection_budget.count + 1,
+                    tokens_used = reflection_budget.tokens_used + EXCLUDED.tokens_used,
+                    updated_at = now()
+                """,
+                hour_window,
+                tokens_used,
+            )
     except Exception as e:
         logger.warning(f"Error incrementing budget: {e}")
 
@@ -207,15 +216,15 @@ async def micro_reflection(qdrant: AsyncQdrantClient) -> dict:
     hour_window = now.strftime("%Y-%m-%dT%H")
     
     # ── Budget check ──────────────────────────────────────────────────────
-    max_per_hour = int(os.environ.get("MICRO_REFLECTION_MAX_PER_HOUR", "5"))
-    current_count = get_budget_for_hour(hour_window)
-    
+    max_per_hour = int(config.reflection.max_per_hour)
+    current_count = await get_budget_for_hour(hour_window)
+
     if current_count >= max_per_hour:
         logger.info(f"Micro-reflection budget exhausted for {hour_window} ({current_count}/{max_per_hour})")
         return {"status": "budget_exceeded", "processed": 0}
-    
+
     # ── Select chunks ─────────────────────────────────────────────────────
-    max_chunks = int(os.environ.get("MICRO_REFLECTION_MAX_CHUNKS", "10"))
+    max_chunks = int(config.reflection.max_chunks)
     
     filter_chunks = Filter(
         must=[
@@ -274,8 +283,8 @@ async def micro_reflection(qdrant: AsyncQdrantClient) -> dict:
             vector = point_data[0].vector.get("dense") if isinstance(point_data[0].vector, dict) else point_data[0].vector
             
             async with httpx.AsyncClient() as client:
-                qdrant_host = os.environ.get("QDRANT_HOST", "qdrant-maas")
-                qdrant_port = int(os.environ.get("QDRANT_PORT", "6333"))
+                qdrant_host = config.qdrant.host
+                qdrant_port = int(config.qdrant.port)
                 resp = await client.post(
                     f"http://{qdrant_host}:{qdrant_port}/collections/{COLLECTION_NAME}/points/search",
                     json={
@@ -361,7 +370,7 @@ async def micro_reflection(qdrant: AsyncQdrantClient) -> dict:
             logger.warning(f"Error updating chunk {chunk_id}: {e}")
     
     # Increment budget
-    increment_budget(hour_window, tokens_used=0)
+    await increment_budget(hour_window, tokens_used=0)
     
     logger.info(f"Micro-reflection completed: {processed} chunks, {contradictions} contradictions, {consistencies} consistent")
     

@@ -1,20 +1,30 @@
 # Layer 5 — Vector Database (Qdrant)
 
-> **Service:** Qdrant 1.17+ (Docker)
-> **Collection:** `knowledge_base` (4096d Cosine + BM25 sparse)
-> **Embedding:** Qwen3-Embedding-8B via OpenRouter (default; configurable)
-> **Endpoint:** `http://localhost:6333`
+> **Service:** Qdrant 1.17+ (reachable at `config.qdrant.url`)
+> **Collection:** `config.qdrant.collection` (4096d Cosine + BM25 sparse by default)
+> **Embedding:** any LiteLLM-brokered OpenAI-compatible embedding model. Default: `rapid-mlx-qwen3-embedding-8b` (local MLX serving Qwen3-Embedding-8B)
+> **Endpoint:** declared in `config/services.yaml`
 
-## Why Qwen3-Embedding-8B
+## Embedding model
 
-The default embedding model is **Qwen3-Embedding-8B** for four reasons:
+The default `rapid-mlx-qwen3-embedding-8b` (Qwen3-Embedding-8B served via LiteLLM):
 
-1. **Multilingual** — strong performance across 50+ languages, including Portuguese, Spanish, and other non-English content common in real-world agent use
-2. **Quality** — 4096-dimensional embeddings with high semantic fidelity; consistently ranks near the top of the MTEB leaderboard
-3. **Speed** — fast inference at 8B parameters, suitable for hourly ingestion pipelines without bottlenecking the ARQ worker
-4. **Cost** — affordable via OpenRouter ($0.025/1M tokens at time of writing); a full wiki re-index costs cents, not dollars
+1. **Multilingual** — strong performance across 50+ languages
+2. **Quality** — 4096-dimensional embeddings; consistently near the top of the MTEB leaderboard
+3. **Speed** — fast inference at 8B parameters; suitable for hourly ingestion pipelines
+4. **Local-friendly** — runs on Apple-Silicon MLX, or via any OpenAI-compatible backend behind LiteLLM (Ollama, vLLM, llama.cpp, OpenAI, OpenRouter, etc.)
 
-Users can switch to any OpenAI-compatible embedding API by setting `EMBEDDING_API_BASE` and `EMBEDDING_MODEL` in `.env`. If changing models, ensure `EMBEDDING_DIMS` matches both the new model's output and the Qdrant collection schema.
+Switching models requires only two edits to `config/services.yaml`:
+
+```yaml
+litellm:
+  models:
+    embedding:
+      name: my-embedding-model
+      dimensions: 1024
+```
+
+…and recreating the Qdrant collection so the `dense` vector size matches. The dimension validation in `docker/worker/services/embedding.py` raises immediately on a mismatch.
 
 ## What it stores
 
@@ -33,7 +43,7 @@ All knowledge that benefits from semantic search — wiki pages, session transcr
 1. Hybrid: dense (4096d cosine) + sparse (BM25) → RRF fusion
 2. Dense-only: if sparse fails → pure vector search
 3. Lexical: if Qdrant offline → markdown file search in vault
-4. SQLite: if vault inaccessible → keyword search in lineage table
+4. Postgres FTS: if vault inaccessible → tsvector @@ to_tsquery over lineage.query
 5. None: all exhausted → return empty (fail-open)
 ```
 
@@ -63,13 +73,13 @@ All knowledge that benefits from semantic search — wiki pages, session transcr
 
 ```python
 _search_qdrant(query, top_k=2, threshold=0.55):
-    1. Embed user message via context_enhancer pipeline
+    1. Embed user message via context_enhancer pipeline (LiteLLM)
     2. search_with_fallback() → 4-level cascade
     3. Results labeled [qdrant] in system prompt
     4. Per-session dedup by point ID
 ```
 
-**Key injection pitfall:** `context_enhancer.py` reads `OPENROUTER_API_KEY` (singular), but some environments use split keys. Before importing, inject: `os.environ["OPENROUTER_API_KEY"] = resolved_key`.
+**Auth:** `context_enhancer.py` reads `config.litellm.api_key` (resolved from `${LITELLM_API_KEY}` in `.env`). No per-process env propagation needed — the hook and the script read the same `config/services.yaml`.
 
 **Social closer gate:** Trivial messages ("ok", "thanks", emoji-only) skip Qdrant search entirely — no point embedding small talk.
 
@@ -82,11 +92,11 @@ File in $VAULT_PATH/wiki/
 wiki-continuous-ingest (hourly cron)
     │ SHA-256 diff detection
     ▼
-Redis queue (ARQ job)
+Valkey queue (ARQ job)
     │
     ▼
 ARQ Worker (Docker)
-    │ embed via configured backend (default: Qwen3-Embedding-8B)
+    │ embed via LiteLLM (config.litellm.models.embedding.name)
     │ get_sparse_embedding() → BM25 (fastembed, local)
     ▼
 Qdrant upsert (with dedup check)
@@ -96,6 +106,6 @@ Qdrant upsert (with dedup check)
 
 - **Named vectors are mandatory in Qdrant 1.17+:** `upsert` requires `"vector": {"dense": vec}`, plain vectors are rejected silently
 - **`AsyncQdrantClient.search()` doesn't exist in qdrant-client 1.18:** Use REST API `POST /collections/{name}/points/search`
-- **Embedding dimension mismatch is silent:** If env says 1024 but collection is 4096, OpenRouter truncates via Matryoshka — vectors are valid but degraded
-- **Decay scanner is inert without payload metadata:** Requires `importance_score`, `last_accessed_at`, `confidence_score` in point payloads. Missing → all points get `decay_score=1.0` → nothing archived
+- **Embedding dimension mismatch is caught early:** `docker/worker/services/embedding.py` validates `len(vec) == config.litellm.models.embedding.dimensions` and raises immediately. Set `dimensions` in YAML to match the model AND the Qdrant collection schema before re-indexing.
+- **Decay scanner is inert without payload metadata:** Requires `importance_score`, `last_accessed_at`, `confidence_score` in point payloads. Missing → all points get `decay_score=1.0` → nothing archived. Run `scripts/backfill_decay_metadata.py` once before enabling decay.
 - **Isolate persona/relational collections from decay/dedup** — they preserve temporal variation
