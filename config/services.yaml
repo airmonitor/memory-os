@@ -1,0 +1,75 @@
+# Memory OS — service configuration (single source of truth, committed default)
+# Host-specific values (connection IPs/URLs, local paths) carry NO inline default —
+# they MUST come from .env per host. Universal structural/operational defaults
+# (ports, VALKEY_DB:0, embedding dims, model names, pool/arq/reflection/search tuning)
+# stay inline so the file works out-of-box once .env supplies hosts + secrets.
+# Local overrides go to config/services.local.yaml (gitignored, deep-merged on top).
+
+postgres:
+  host: ${POSTGRES_IP}
+  port: ${POSTGRES_PORT:5432}
+  user: ${POSTGRES_USER_NAME:postgres}
+  password: ${POSTGRES_USER_PASSWORD}
+  database: ${POSTGRES_DB:memos}
+  pool:
+    min_size: 1
+    max_size: 4
+
+valkey:                              # Redis-compatible drop-in
+  host: ${VALKEY_IP}
+  port: ${VALKEY_PORT:6389}
+  password: ${VALKEY_PASSWORD}       # empty OK for LAN without auth
+  db: ${VALKEY_DB:0}                 # logical DB index — per-agent isolation (tr=0, seo=1, ...)
+  arq:
+    queue_prefix: "arq:queue:"
+    max_jobs: 10
+    job_timeout: 300
+    keep_result: 3600
+
+qdrant:
+  url: ${QDRANT_URL}
+  host: ${QDRANT_HOST}
+  port: ${QDRANT_PORT:6333}
+  api_key: ${QDRANT_API_KEY}         # empty OK
+  collection: ${QDRANT_COLLECTION:knowledge_base}
+
+litellm:
+  base_url: ${LITELLM_URL}
+  api_key: ${LITELLM_API_KEY}
+  models:
+    embedding:
+      name: ${EMBEDDING_MODEL:rapid-mlx-qwen3-embedding-8b}
+      dimensions: ${EMBEDDING_DIMENSIONS:4096}
+      context_length: ${EMBEDDING_CONTEXT_LENGTH:32768}
+    chat:
+      name: ${CHAT_MODEL:lm-studio-qwen3.6}
+      max_tokens: 4096
+      temperature: 0.7
+    extraction:                      # icarus/hooks.py LLM extraction
+      name: ${EXTRACTION_MODEL:lm-studio-qwen3.6}
+      max_tokens: ${ICARUS_EXTRACTION_MAX_TOKENS:4096}
+
+paths:                               # SQLite + local paths — host-specific, set in .env
+  hermes_home: ${HERMES_HOME}
+  state_db: ${STATE_DB_PATH}
+  memory_store_db: ${MEMORY_STORE_DB}
+  fabric_dir: ${FABRIC_DIR}
+  vault: ${VAULT_PATH}
+  wiki_root: ${WIKI_ROOT}
+  telemetry_log: ${TELEMETRY_LOG_PATH}
+  reflection_log: ${REFLECTION_LOG_PATH}
+
+# Reflection budget tuning
+reflection:
+  max_per_hour: 5
+  max_chunks: 10
+
+# Search defaults (context_enhancer)
+search:
+  top_k: 3
+  score_threshold: 0.55
+  max_text_len: 8000
+  request_timeout: 10
+
+logging:
+  level: INFO
