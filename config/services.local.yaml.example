@@ -1,16 +1,80 @@
 # Example local override file. Copy to services.local.yaml (gitignored) and edit.
-# Deep-merged on top of services.yaml. Useful for dev/prod differences.
+# Deep-merged on top of services.yaml (dict values merge, scalars replace).
 #
-# Example: point to a different Postgres instance for local dev:
+# This template mirrors EVERY key in services.yaml so it doubles as the full
+# config schema. Uncomment only the keys you actually want to override on this
+# host — anything left commented falls through to the services.yaml default
+# (shown below as ${ENV_VAR:default}). Secrets still come from .env; you rarely
+# need them here.
 #
+# Per-agent isolation note (MemoryOS multi-tenant): a second agent on shared
+# Postgres/Valkey/Qdrant overrides POSTGRES_DB, QDRANT_COLLECTION and the Valkey
+# logical DB index — set those via .env (VALKEY_DB=1, POSTGRES_DB=seo_memos, ...)
+# or uncomment them here.
+
 # postgres:
-#   host: 127.0.0.1
-#   port: 5433
-#
-# Example: override embedding model:
-#
+#   host: ${POSTGRES_IP:192.168.1.134}
+#   port: ${POSTGRES_PORT:5432}
+#   user: ${POSTGRES_USER_NAME:postgres}
+#   password: ${POSTGRES_USER_PASSWORD}        # secret — prefer .env
+#   database: ${POSTGRES_DB:memos}             # per-agent: {NS}_memos
+#   pool:
+#     min_size: 1
+#     max_size: 4
+
+# valkey:                                      # Redis-compatible drop-in
+#   host: ${VALKEY_IP:192.168.1.134}
+#   port: ${VALKEY_PORT:6389}
+#   password: ${VALKEY_PASSWORD}               # empty OK for LAN without auth
+#   db: ${VALKEY_DB:0}                         # logical DB index — per-agent isolation (tr=0, seo=1, ...)
+#   arq:
+#     queue_prefix: "arq:queue:"
+#     max_jobs: 10
+#     job_timeout: 300
+#     keep_result: 3600
+
+# qdrant:
+#   url: ${QDRANT_URL:http://192.168.1.135:6333}
+#   host: ${QDRANT_HOST:192.168.1.135}
+#   port: ${QDRANT_PORT:6333}
+#   api_key: ${QDRANT_API_KEY}                 # empty OK
+#   collection: ${QDRANT_COLLECTION:knowledge_base}   # per-agent: {NS}_knowledge_base
+
 # litellm:
+#   base_url: ${LITELLM_URL}
+#   api_key: ${LITELLM_API_KEY}                # secret — prefer .env
 #   models:
 #     embedding:
-#       name: text-embedding-3-small
-#       dimensions: 1536
+#       name: ${EMBEDDING_MODEL:rapid-mlx-qwen3-embedding-8b}
+#       dimensions: ${EMBEDDING_DIMENSIONS:4096}        # MUST match the Qdrant collection
+#       context_length: ${EMBEDDING_CONTEXT_LENGTH:32768}
+#     chat:
+#       name: ${CHAT_MODEL:lm-studio-qwen3.6}
+#       max_tokens: 4096
+#       temperature: 0.7
+#     extraction:                              # icarus/hooks.py LLM extraction
+#       name: ${EXTRACTION_MODEL:lm-studio-qwen3.6}
+#       max_tokens: ${ICARUS_EXTRACTION_MAX_TOKENS:4096}
+
+# paths:                                       # SQLite + local paths
+#   hermes_home: ${HERMES_HOME:/home/user/.hermes}
+#   state_db: ${STATE_DB_PATH:/home/user/.hermes/state.db}
+#   memory_store_db: ${MEMORY_STORE_DB:/home/user/.hermes/memory_store.db}
+#   fabric_dir: ${FABRIC_DIR:/home/user/vault/fabric}
+#   vault: ${VAULT_PATH:/home/user/vault}
+#   wiki_root: ${WIKI_ROOT:/home/user/vault/wiki}
+#   telemetry_log: ${TELEMETRY_LOG_PATH:/home/user/.hermes/logs/query-telemetry.jsonl}
+#   reflection_log: ${REFLECTION_LOG_PATH:/home/user/.hermes/logs/reflection_trigger.log}
+
+# reflection:                                  # Reflection budget tuning
+#   max_per_hour: 5
+#   max_chunks: 10
+
+# search:                                      # Search defaults (context_enhancer)
+#   top_k: 3
+#   score_threshold: 0.55
+#   max_text_len: 8000
+#   request_timeout: 10
+
+# logging:
+#   level: INFO
