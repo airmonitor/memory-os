@@ -72,11 +72,19 @@ def get_tags_from_frontmatter(meta: dict) -> list[str]:
         tags = [t.strip() for t in tags.split(",")]
     return tags if isinstance(tags, list) else []
 
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def _strip_lone_surrogates(text: str) -> str:
+    """Drop unpaired UTF-16 surrogates; they crash LiteLLM's UTF-8 cache-key hash."""
+    return _LONE_SURROGATE_RE.sub("", text)
+
+
 async def get_embedding(session: aiohttp.ClientSession, text: str) -> list[float] | None:
     """Generate embedding via LiteLLM."""
     payload = {
         "model": EMBEDDING_MODEL,
-        "input": text[:MAX_TEXT_LEN],
+        "input": _strip_lone_surrogates(text[:MAX_TEXT_LEN]),
         "dimensions": EMBEDDING_DIMS,
     }
     headers = {"Content-Type": "application/json"}

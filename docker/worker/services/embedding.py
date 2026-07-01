@@ -5,6 +5,7 @@ model, and expected dimensions from config/services.yaml.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -21,12 +22,35 @@ from memos_config import config  # noqa: E402
 
 logger = logging.getLogger("cognitive-worker.embedding")
 
+# Lone (unpaired) UTF-16 surrogates. Valid emoji/astral chars are single
+# non-surrogate code points in a Python 3 str, so this NEVER matches them; it
+# only matches genuinely broken input (a surrogate pair split mid-character
+# upstream, or malformed unicode emitted by an LLM extraction step).
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def _strip_lone_surrogates(text: str) -> str:
+    """
+    Remove unpaired UTF-16 surrogates so the text is UTF-8 encodable.
+
+    LiteLLM's redis cache builds the cache key with
+    hashlib.sha256(cache_key.encode()) (strict UTF-8). A lone surrogate (e.g.
+    \\ud83c) raises UnicodeEncodeError "surrogates not allowed", which 500s the
+    embedding request through every fallback. Sanitizing here kills the bad data
+    at the source instead of relying on the proxy-side cache-type workaround.
+    """
+    cleaned, n = _LONE_SURROGATE_RE.subn("", text)
+    if n:
+        logger.warning("Stripped %d lone surrogate(s) from embedding input", n)
+    return cleaned
+
 
 async def get_embedding(text: str) -> list[float]:
     """
     Generate embedding via LiteLLM. Validates returned dimensions against
     config.litellm.models.embedding.dimensions.
     """
+    text = _strip_lone_surrogates(text)
     base_url = config.litellm.base_url.rstrip("/")
     api_key = config.litellm.api_key or ""
     model = config.litellm.models.embedding.name

@@ -85,6 +85,14 @@ def infer_domain_tags(description: str) -> List[str]:
 
 # ─── Core ───────────────────────────────────────────────────────────────────
 
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def _strip_lone_surrogates(text: str) -> str:
+    """Drop unpaired UTF-16 surrogates; they crash LiteLLM's UTF-8 cache-key hash."""
+    return _LONE_SURROGATE_RE.sub("", text)
+
+
 def embed_text(text: str) -> Optional[List[float]]:
     """Generate embedding via LiteLLM. Fail-open: return None on any error."""
     try:
@@ -96,7 +104,7 @@ def embed_text(text: str) -> Optional[List[float]]:
             headers=headers,
             json={
                 "model": EMBEDDING_MODEL,
-                "input": text[:8000],
+                "input": _strip_lone_surrogates(text[:8000]),
                 "dimensions": EMBEDDING_DIMS,
             },
             timeout=REQUEST_TIMEOUT,
