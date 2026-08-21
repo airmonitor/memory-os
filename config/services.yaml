@@ -55,6 +55,30 @@ litellm:
       # OpenRouter answer sat one unreachable hop away. Raise the proxy's
       # timeout and you must raise this one with it.
       timeout: ${EMBEDDING_TIMEOUT:100}
+      # Comma-separated model groups to fall back to, sent PER REQUEST because
+      # the gateway will not apply its own chain. Empty disables it.
+      #
+      # LiteLLM does hold `router_settings.fallbacks` for the embedding group
+      # and reports it via /get/config/callbacks, but it never fires: at
+      # router.py:6414 the router reads `kwargs.get("fallbacks", self.fallbacks)`
+      # and the key's PRESENCE decides, so the configured list is shadowed and
+      # the default branch is never taken. Measured on the same proxy
+      # (litellm.airmonitor.pl) 2026-08-21 by boot_email_inbox 0.2.12: without
+      # the key in the body 408 after 61.6 s, with it 200 in 62.0 s carrying
+      # `x-litellm-attempted-fallbacks: 1`. Verified unchanged in LiteLLM
+      # v1.97.0, so waiting for an upgrade is not a plan.
+      #
+      # SAME MODEL OR NOTHING. Everything listed here must be the same
+      # embedder as `name` above - same weights, same `dimensions` - because a
+      # differently-shaped vector written into a collection frozen at 4096
+      # corrupts the corpus silently. qwen3-embedding-8b is the OpenRouter twin
+      # of the local rapid-mlx deployment: same Qwen3-Embedding-8B, different
+      # provider. It is also PAID, so an MLX slowdown becomes a bill rather
+      # than a stall - the trade is deliberate.
+      #
+      # Never send an empty list: `[]` is as PRESENT as a full one and shadows
+      # the router exactly like `None`. The consumer must omit the key instead.
+      fallbacks: ${EMBEDDING_FALLBACKS:qwen3-embedding-8b}
     chat:
       name: ${CHAT_MODEL:lm-studio-qwen3.6}
       max_tokens: 4096

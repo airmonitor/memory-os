@@ -72,6 +72,16 @@ async def get_embedding(text: str) -> list[float]:
         "dimensions": expected_dims,  # OpenAI-style; local servers may ignore
     }
 
+    # Per-request fallback chain. The gateway holds one for this model group and
+    # never applies it — see the comment on this key in config/services.yaml.
+    # Only ever added when non-empty: `fallbacks: []` is as PRESENT as a full
+    # list and shadows the router the same way `None` does, so an empty setting
+    # must leave the key OUT of the body rather than send it empty.
+    raw_fallbacks = getattr(config.litellm.models.embedding, "fallbacks", "") or ""
+    fallbacks = [m.strip() for m in str(raw_fallbacks).split(",") if m.strip()]
+    if fallbacks:
+        payload["fallbacks"] = fallbacks
+
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
             f"{base_url}/embeddings",
