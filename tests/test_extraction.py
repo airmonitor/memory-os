@@ -1,4 +1,4 @@
-from icarus import extraction
+from icarus import extraction, state
 from icarus.hermes_state import Message
 
 
@@ -47,3 +47,23 @@ def test_score_rises_with_substance_and_stays_low_for_chatter():
 
 def test_scoring_never_divides_by_zero_on_an_empty_slice():
     assert extraction.score_exchanges([])["total"] == 0.0
+
+
+def test_shared_regex_objects_are_identical():
+    """Prevent DECISION_RE and OUTCOME_RE from drifting between modules."""
+    assert state.DECISION_RE is extraction.DECISION_RE
+    assert state.OUTCOME_RE is extraction.OUTCOME_RE
+
+
+def test_agent_initiated_turn_starts_anonymous_exchange():
+    """Assistant content before the first user message is preserved in an anonymous exchange."""
+    ex = extraction.messages_to_exchanges([
+        M(1, "assistant", "here's a thought"),
+        M(2, "user", "thanks"),
+        M(3, "assistant", "you're welcome"),
+    ])
+    assert len(ex) == 2
+    assert ex[0]["user"] == ""
+    assert ex[0]["assistant"] == "here's a thought"
+    assert ex[1]["user"] == "thanks"
+    assert ex[1]["assistant"] == "you're welcome"

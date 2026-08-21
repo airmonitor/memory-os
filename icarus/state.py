@@ -25,12 +25,11 @@ if not AGENT_NAME and HERMES_HOME and ".hermes-" in str(HERMES_HOME):
     AGENT_NAME = str(HERMES_HOME).split(".hermes-")[-1].rstrip("/")
 
 # ── Shared regexes (used by hooks.py and scoring) ────────
-DECISION_RE = re.compile(
-    r"(?i)\b(decided|resolved|completed|fixed|deployed|shipped|reviewed|approved|rejected)\b"
-)
-OUTCOME_RE = re.compile(
-    r"(?i)(result:|outcome:|conclusion:|because|root cause|instead of|\d+%|\d+x)"
-)
+# DECISION_RE and OUTCOME_RE are defined in extraction.py to ensure the sweeper
+# and plugin share one implementation; they are imported below to keep this module
+# free of duplication.
+from .extraction import DECISION_RE, OUTCOME_RE  # noqa: E402
+
 COMPLETION_RE = re.compile(
     r"(?i)\b(completed|finished|done|shipped|deployed|resolved|closed|merged|fixed)\b"
 )
