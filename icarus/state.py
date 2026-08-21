@@ -305,14 +305,17 @@ def _parse_frontmatter_scalar(text, key):
 def write_entry(entry_type, content, summary, tier="hot", tags="", platform="cli",
                 status="", outcome="", review_of="", revises="", customer_id="",
                 assigned_to="", training_value="", verified="", evidence="",
-                source_tool="", artifact_paths=""):
+                source_tool="", artifact_paths="", suffix=None):
     """Write a fabric entry with full schema v1 fields. Returns the filepath."""
     FABRIC_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
     ts = now.strftime("%Y-%m-%dT%H%MZ")
     ts_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     agent = AGENT_NAME or "agent"
-    suffix = secrets.token_hex(2)
+    # A caller that can retry (the sweeper) passes a suffix derived from the
+    # slice, so republishing the same slice OVERWRITES its entry instead of
+    # producing a second copy. Random stays the default for interactive callers.
+    suffix = suffix or secrets.token_hex(2)
     # derive a short slug from the summary for human-readable filenames
     slug = re.sub(r"[^a-z0-9]+", "-", summary.lower().strip())[:40].strip("-")
     if slug:
@@ -365,7 +368,9 @@ def write_entry(entry_type, content, summary, tier="hot", tags="", platform="cli
     lines.extend(["---", "", content])
 
     path = FABRIC_DIR / filename
-    path.write_text("\n".join(lines), "utf-8")
+    tmp = path.with_suffix(".md.tmp")
+    tmp.write_text("\n".join(lines), "utf-8")
+    os.replace(tmp, path)          # atomic within one filesystem
     logger.info("icarus: wrote %s", filename)
 
     # opt-in obsidian formatting
