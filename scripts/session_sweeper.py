@@ -62,18 +62,22 @@ def redispatch(deps: Deps) -> int:
     sent = 0
     for row in deps.pg.pending_dispatch():
         job_ids = []
+        # mark_published is INSIDE this try on purpose: it is a Postgres call
+        # like any other, so it can raise too, and redispatch() runs before
+        # candidate selection even begins — an uncaught raise here would abort
+        # the whole sweep, not just this one pending row.
         try:
             for item in row["payload"]:
                 deps.enqueue("process_ingestion", item["text"], "session",
                              job_id=item["job_id"])
                 job_ids.append(item["job_id"])
+            deps.pg.mark_published(session_id=row["session_id"],
+                                   last_message_id=row["last_message_id"], jobs=job_ids)
+            sent += 1
         except Exception as exc:
             logger.warning("re-dispatch of %s:%s failed: %s",
                            row["session_id"], row["last_message_id"], exc)
             continue
-        deps.pg.mark_published(session_id=row["session_id"],
-                               last_message_id=row["last_message_id"], jobs=job_ids)
-        sent += 1
     return sent
 
 
@@ -107,8 +111,17 @@ def sweep(deps: Deps, cfg: dict) -> dict:
 
     for cand, context, messages in slices:
         first_id, last_id = messages[0].id, messages[-1].id
-        if not deps.pg.claim(session_id=cand.session_id, first_message_id=first_id,
-                             last_message_id=last_id, message_count=len(messages)):
+        # claim() is a Postgres round trip like any other and can raise (a
+        # dropped connection, a lock timeout). One bad slice must not stop the
+        # sweep, so a raise here is logged and this slice is skipped — it will
+        # be offered again on the next sweep, since nothing was claimed.
+        try:
+            won = deps.pg.claim(session_id=cand.session_id, first_message_id=first_id,
+                                last_message_id=last_id, message_count=len(messages))
+        except Exception as exc:
+            logger.warning("claim for slice %s:%s failed: %s", cand.session_id, last_id, exc)
+            continue
+        if not won:
             logger.info("slice %s:%s already claimed", cand.session_id, last_id)
             continue
 
@@ -249,8 +262,10 @@ def _dry_run_stubs(deps: Deps, pg: _PgAdapter) -> None:
     genuinely existing 'extracted' rows via a real pending_dispatch(). Without
     also stubbing the mark_* calls, a dry run would silently flip those rows to
     'published' while enqueue_stub sends nothing — permanently losing slices a
-    real run left mid-flight. So every write goes through the stub; only reads
-    (watermarks, pending_dispatch, ensure_schema) stay real."""
+    real run left mid-flight. So every write — including schema DDL and the
+    end-of-run status row — goes through a stub; only reads (watermarks,
+    pending_dispatch) stay real."""
+    pg.ensure_schema = lambda: logger.info("[dry-run] would ensure_schema")
     pg.claim = lambda **kw: True
     pg.mark_extracted = lambda **kw: logger.info(
         "[dry-run] would mark_extracted %s:%s", kw.get("session_id"), kw.get("last_message_id"))
@@ -258,6 +273,7 @@ def _dry_run_stubs(deps: Deps, pg: _PgAdapter) -> None:
         "[dry-run] would mark_published %s:%s", kw.get("session_id"), kw.get("last_message_id"))
     pg.mark_failed = lambda **kw: logger.info(
         "[dry-run] would mark_failed %s:%s", kw.get("session_id"), kw.get("last_message_id"))
+    pg.record_run = lambda **kw: logger.info("[dry-run] would record_run %s", kw)
 
     def extract_stub(transcript):
         logger.info("[dry-run] would extract from a %d-char transcript", len(transcript))
@@ -342,11 +358,14 @@ def main(argv=None) -> dict:
         raise
     finally:
         # "Stalled" must be a query, not an inspection (ADR-0001 §5): every
-        # run — success or failure — leaves a sweeper_status row.
+        # run — success or failure — leaves a sweeper_status row. Routed
+        # through deps.pg (not scripts.session_store directly against
+        # pg_conn), so --dry-run's stubbing of deps.pg.record_run actually
+        # covers this call instead of being bypassed by a second write path.
         r = result or {}
         try:
-            session_store.record_run(
-                pg_conn, candidates=r.get("candidates", 0), extracted=r.get("extracted", 0),
+            deps.pg.record_run(
+                candidates=r.get("candidates", 0), extracted=r.get("extracted", 0),
                 entries=r.get("entries", 0), jobs=r.get("jobs", 0),
                 schema_version=hermes_state.schema_version(sqlite_conn), error=error)
         except Exception:

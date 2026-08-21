@@ -248,3 +248,145 @@ def test_context_tail_feeds_the_continuation_transcript(hermes_db):
     context_part, _, current_part = transcript.partition("=== CURRENT SLICE ===")
     assert "d" * 200 in context_part
     assert "d" * 200 not in current_part
+
+
+def two_eligible_sessions(now):
+    """Two quiet, substantive sessions — same shape as
+    test_max_per_run_bounds_the_number_of_llm_calls, but only two of them, and
+    with each session's last message id handed back so tests can assert on
+    specific job/entry ids without recomputing the arithmetic."""
+    sessions, messages, last_ids = [], [], {}
+    for n in range(2):
+        sid = f"s{n}"
+        sessions.append(SESSION(sid, last_activity_at=now - 2 * HOUR, message_count=4))
+        base = 100 * n
+        for i in range(2):
+            messages.append(MSG(base + 2 * i + 1, sid, "user", "u" * 60))
+            messages.append(MSG(base + 2 * i + 2, sid, "assistant",
+                                "decided. Result: works. " + "d" * 200))
+        last_ids[sid] = base + 4
+    return sessions, messages, last_ids
+
+
+class RaisingPg:
+    """Every write-path method raises. If dry-run stubbing is complete, none
+    of these are ever reached — the reads (watermarks, pending_dispatch) are
+    real, harmless no-ops, since dry-run must not need them stubbed too."""
+
+    def ensure_schema(self):
+        raise AssertionError("ensure_schema must not run under --dry-run")
+
+    def watermarks(self):
+        return {}
+
+    def claim(self, **kw):
+        raise AssertionError("claim must not run under --dry-run")
+
+    def mark_extracted(self, **kw):
+        raise AssertionError("mark_extracted must not run under --dry-run")
+
+    def mark_published(self, **kw):
+        raise AssertionError("mark_published must not run under --dry-run")
+
+    def mark_failed(self, **kw):
+        raise AssertionError("mark_failed must not run under --dry-run")
+
+    def pending_dispatch(self):
+        return []
+
+    def record_run(self, **kw):
+        raise AssertionError("record_run must not run under --dry-run")
+
+
+def _boom(*a, **kw):
+    raise AssertionError("must not run under --dry-run")
+
+
+def test_dry_run_performs_no_postgresql_write(hermes_db):
+    now = time.time()
+    sessions, messages = rich_session(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = RaisingPg()
+    deps = sw.Deps(
+        sqlite_conn=hs.connect_ro(path), pg=pg,
+        # A real extract, plus write_entry/enqueue that raise if reached,
+        # prove the dry-run stubs actually replace them rather than merely
+        # being layered on top.
+        extract=lambda t: [{"type": "decision", "summary": "s", "content": "c",
+                            "training_value": "high"}],
+        write_entry=_boom, enqueue=_boom, now=time.time)
+    sw._dry_run_stubs(deps, pg)
+    result = sw.sweep(deps, CFG)
+    # Every entry point on `pg`, plus the real extract/write_entry/enqueue
+    # above, would raise if actually reached. Completing at all proves the
+    # dry-run stubs intercepted every one of them.
+    assert result["candidates"] == 1
+    # extract_stub always returns [] regardless of the real `extract` supplied
+    # above — a dry run must never depend on what the LLM would have said.
+    assert result["extracted"] == 1 and result["entries"] == 0 and result["jobs"] == 0
+
+
+class ClaimBoomOnFirst(FakePg):
+    """Like FakePg, except claim() raises for one specific session — a
+    Postgres round trip failing for one candidate, not a lost race."""
+
+    def __init__(self, boom_session, **kw):
+        super().__init__(**kw)
+        self.boom_session = boom_session
+
+    def claim(self, **kw):
+        if kw["session_id"] == self.boom_session:
+            raise RuntimeError("db down")
+        return super().claim(**kw)
+
+
+def test_a_claim_failure_does_not_stop_other_candidates(hermes_db):
+    now = time.time()
+    sessions, messages, last_ids = two_eligible_sessions(now)
+    pg = ClaimBoomOnFirst("s0")
+    deps, written, jobs = make_deps(hermes_db(sessions=sessions, messages=messages), pg)
+    result = sw.sweep(deps, CFG)
+    assert result["candidates"] == 2
+    assert result["extracted"] == 1
+    # s0's claim raised before any row was created for it.
+    assert ("s0", last_ids["s0"]) not in pg.claimed
+    # s1 was claimed, extracted and dispatched normally.
+    assert pg.claimed[("s1", last_ids["s1"])] == "published"
+    assert jobs == [sw.job_id("s1", last_ids["s1"], 0)]
+
+
+def test_a_mark_published_failure_in_redispatch_does_not_abort_the_sweep(hermes_db):
+    now = time.time()
+    sessions, messages = rich_session(now)
+    pg = FakePg()
+    # A stale row a prior run left extracted but never dispatched.
+    pg.claimed[("old", 5)] = "extracted"
+    pg.payloads[("old", 5)] = [{"job_id": "ingest:old:5:0", "text": "stale"}]
+
+    real_mark_published = pg.mark_published
+
+    def boom_mark_published(**kw):
+        if kw["session_id"] == "old":
+            raise RuntimeError("db down during redispatch")
+        return real_mark_published(**kw)
+    pg.mark_published = boom_mark_published
+
+    deps, written, jobs = make_deps(hermes_db(sessions=sessions, messages=messages), pg)
+    result = sw.sweep(deps, CFG)
+    # redispatch()'s failure on the stale row must not prevent candidate
+    # selection, or the new session's own extraction, from running.
+    assert result["redispatched"] == 0
+    assert result["candidates"] == 1
+    assert result["extracted"] == 1
+    assert pg.claimed[("old", 5)] == "extracted"  # left exactly as redispatch found it
+    assert pg.claimed[("s", 12)] == "published"
+
+
+def test_session_filter_limits_the_sweep_to_one_session(hermes_db):
+    now = time.time()
+    sessions, messages, last_ids = two_eligible_sessions(now)
+    deps, written, jobs = make_deps(hermes_db(sessions=sessions, messages=messages), FakePg())
+    result = sw.sweep(deps, dict(CFG, session_id="s1"))
+    assert result["candidates"] == 1
+    assert result["extracted"] == 1
+    assert jobs == [sw.job_id("s1", last_ids["s1"], 0)]
