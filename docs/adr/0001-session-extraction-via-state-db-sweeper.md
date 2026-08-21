@@ -153,7 +153,13 @@ State machine in PostgreSQL, table `session_extraction`, `UNIQUE (session_id, la
 4. **Dispatch** — ARQ `enqueue_job(..., _job_id=f"ingest:{session_id}:{last_message_id}:{i}")`.
    arq 0.28 refuses a duplicate job id, so re-running after a crash cannot double-ingest.
    The outbox row is marked `published` only after the enqueue returns; a crash in between
-   leaves `status='extracted'`, which the next sweep re-dispatches under the same job id.
+   leaves `status='extracted'` **with the entry text stored on the claim row**, and every
+   sweep drains those before doing new work — re-dispatching under the same job id and paying
+   no second LLM call.
+5. **Reclaim** — a row stuck at `claimed` for more than `STALE_CLAIM_HOURS` (a crash between
+   claim and extraction) is re-claimable, as is a `failed` row. Without that rule the unique
+   key turns one crash into one permanently lost conversation, because `watermarks()` counts
+   the abandoned row.
 
 ### 4. Transcript fidelity
 

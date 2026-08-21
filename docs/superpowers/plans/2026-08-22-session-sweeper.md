@@ -874,6 +874,23 @@ def test_mark_published_records_the_job_ids():
     assert params[0] == '["ingest:s:9:0"]' or params[0] == ["ingest:s:9:0"]
 
 
+def test_a_stale_claim_can_be_reclaimed_but_a_fresh_one_cannot():
+    conn = FakeConn(results=[(1,)])
+    session_store.claim(conn, session_id="s", first_message_id=1, last_message_id=9,
+                        message_count=5, stale_hours=2)
+    sql, params = conn.log[0]
+    assert "DO UPDATE" in sql
+    assert "status = 'failed'" in sql and "make_interval" in sql
+    assert params[-1] == 2
+
+
+def test_pending_dispatch_returns_the_payload_for_re_dispatch():
+    conn = FakeConn(results=[[("s", 9, [{"job_id": "ingest:s:9:0", "text": "c"}])]])
+    assert session_store.pending_dispatch(conn) == [
+        {"session_id": "s", "last_message_id": 9,
+         "payload": [{"job_id": "ingest:s:9:0", "text": "c"}]}]
+
+
 def test_ensure_schema_is_idempotent_sql():
     conn = FakeConn()
     session_store.ensure_schema(conn)
@@ -918,6 +935,8 @@ if str(_REPO) not in sys.path:
 
 from memos_config import config  # noqa: E402,F401
 
+STALE_CLAIM_HOURS = 2
+
 SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS session_extraction (
@@ -929,6 +948,7 @@ SCHEMA = (
         status           TEXT      NOT NULL DEFAULT 'claimed',
         score            REAL,
         entries          INTEGER   NOT NULL DEFAULT 0,
+        payload          JSONB,
         jobs             JSONB,
         error            TEXT,
         claimed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -959,29 +979,51 @@ def ensure_schema(conn) -> None:
 
 
 def watermarks(conn) -> dict[str, int]:
+    """How far each session has been consumed. 'failed' rows do not count, so a
+    failed slice is offered again on the next sweep."""
     with conn.cursor() as cur:
         cur.execute("""SELECT session_id, MAX(last_message_id) FROM session_extraction
                        WHERE status <> 'failed' GROUP BY session_id""")
         return {row[0]: int(row[1]) for row in cur.fetchall()}
 
 
-def claim(conn, *, session_id, first_message_id, last_message_id, message_count) -> bool:
+def claim(conn, *, session_id, first_message_id, last_message_id, message_count,
+          stale_hours=STALE_CLAIM_HOURS) -> bool:
+    """Win the right to extract this slice. False means somebody else owns it.
+
+    THE `DO UPDATE` BRANCH IS NOT DECORATION. A crash between the claim and the
+    extraction leaves a row stuck at 'claimed', and because `watermarks()` counts
+    it, the slice would never be offered again — one lost conversation per crash,
+    silently, forever. A claim older than `stale_hours`, or one already marked
+    'failed', is therefore re-claimable; a fresh claim is not.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO session_extraction
                    (session_id, first_message_id, last_message_id, message_count)
                VALUES (%s, %s, %s, %s)
-               ON CONFLICT (session_id, last_message_id) DO NOTHING
+               ON CONFLICT (session_id, last_message_id) DO UPDATE
+                   SET status = 'claimed', claimed_at = now(), updated_at = now()
+                   WHERE session_extraction.status = 'failed'
+                      OR (session_extraction.status = 'claimed'
+                          AND session_extraction.updated_at
+                              < now() - make_interval(hours => %s))
                RETURNING id""",
-            (session_id, first_message_id, last_message_id, message_count))
+            (session_id, first_message_id, last_message_id, message_count, stale_hours))
         won = cur.fetchone() is not None
     conn.commit()
     return won
 
 
-def mark_extracted(conn, *, session_id, last_message_id, entries, score) -> None:
+def mark_extracted(conn, *, session_id, last_message_id, entries, score, payload=()) -> None:
+    """Record the extraction AND what still has to be dispatched.
+
+    The payload is what makes re-dispatch possible after a Valkey outage: the
+    next sweep reads it back instead of paying for the LLM call a second time.
+    """
     _update(conn, session_id, last_message_id,
-            "status = 'extracted', entries = %s, score = %s", (entries, score))
+            "status = 'extracted', entries = %s, score = %s, payload = %s",
+            (entries, score, json.dumps(list(payload))))
 
 
 def mark_published(conn, *, session_id, last_message_id, jobs) -> None:
@@ -1003,11 +1045,12 @@ def _update(conn, session_id, last_message_id, assignment, params) -> None:
     conn.commit()
 
 
-def pending_dispatch(conn) -> list[dict]:
+def pending_dispatch(conn, limit=50) -> list[dict]:
+    """Slices extracted but never dispatched — a crash or a broker outage."""
     with conn.cursor() as cur:
-        cur.execute("""SELECT session_id, last_message_id, entries FROM session_extraction
-                       WHERE status = 'extracted' ORDER BY id ASC LIMIT 50""")
-        return [{"session_id": r[0], "last_message_id": int(r[1]), "entries": int(r[2])}
+        cur.execute("""SELECT session_id, last_message_id, payload FROM session_extraction
+                       WHERE status = 'extracted' ORDER BY id ASC LIMIT %s""", (limit,))
+        return [{"session_id": r[0], "last_message_id": int(r[1]), "payload": r[2] or []}
                 for r in cur.fetchall()]
 
 
@@ -1056,11 +1099,18 @@ import pytest
 
 @pytest.fixture
 def fabric(tmp_path, monkeypatch):
-    monkeypatch.setenv("FABRIC_DIR", str(tmp_path / "fabric"))
+    """icarus.state reads FABRIC_DIR at import time, so the module has to be
+    reloaded under the patched environment — and reloaded BACK afterwards, or
+    every later test in the process inherits this tmp_path and
+    `state.exchanges` points at a different module object than the one under
+    test."""
     import importlib
     from icarus import state
+    monkeypatch.setenv("FABRIC_DIR", str(tmp_path / "fabric"))
     importlib.reload(state)
-    return state
+    yield state
+    monkeypatch.undo()
+    importlib.reload(state)
 
 
 def test_same_suffix_overwrites_instead_of_multiplying(fabric):
@@ -1135,7 +1185,8 @@ git commit -m "feat(icarus): deterministic, atomic fabric writes"
 **Interfaces:**
 - Produces:
   - `Deps` dataclass: `sqlite_conn, pg_conn, extract, write_entry, enqueue, now`
-  - `sweep(deps, cfg) -> dict` returning `{"candidates": int, "extracted": int, "entries": int, "jobs": int}`
+  - `sweep(deps, cfg) -> dict` returning `{"candidates": int, "extracted": int, "entries": int, "jobs": int, "redispatched": int}`
+  - `redispatch(deps) -> int` — drains `pending_dispatch()` before any new work
   - `job_id(session_id, last_message_id, index) -> str` → `f"ingest:{session_id}:{last_message_id}:{index}"`
   - `entry_suffix(session_id, last_message_id, index) -> str` (first 8 hex of a sha256)
   - CLI: `--dry-run`, `--session <id>`, `--verbose`
@@ -1157,21 +1208,49 @@ CFG = dict(idle_seconds=90 * 60, min_messages=2, context_overlap=2,
 
 
 class FakePg:
-    def __init__(self, claimed=()):
-        self.claimed, self.calls, self.marks = set(claimed), [], []
+    """Stands in for scripts.session_store. Watermarks are DERIVED from claims,
+    the way the real table derives them, so a second sweep in a test sees what a
+    second sweep in production would see."""
 
-    # session_store surface used by the sweeper
+    def __init__(self, claimed=()):
+        self.claimed = {k: "published" for k in claimed}
+        self.calls, self.marks, self.payloads = [], [], {}
+
     def ensure_schema(self): self.calls.append("ensure_schema")
-    def watermarks(self): return {}
+
+    def watermarks(self):
+        out = {}
+        for (sid, last), status in self.claimed.items():
+            if status == "failed":
+                continue
+            out[sid] = max(out.get(sid, 0), last)
+        return out
+
     def claim(self, **kw):
         key = (kw["session_id"], kw["last_message_id"])
-        if key in self.claimed:
+        if key in self.claimed and self.claimed[key] != "failed":
             return False
-        self.claimed.add(key)
+        self.claimed[key] = "claimed"
         return True
-    def mark_extracted(self, **kw): self.marks.append(("extracted", kw))
-    def mark_published(self, **kw): self.marks.append(("published", kw))
-    def mark_failed(self, **kw): self.marks.append(("failed", kw))
+
+    def mark_extracted(self, **kw):
+        self.claimed[(kw["session_id"], kw["last_message_id"])] = "extracted"
+        self.payloads[(kw["session_id"], kw["last_message_id"])] = list(kw.get("payload", []))
+        self.marks.append(("extracted", kw))
+
+    def mark_published(self, **kw):
+        self.claimed[(kw["session_id"], kw["last_message_id"])] = "published"
+        self.marks.append(("published", kw))
+
+    def mark_failed(self, **kw):
+        self.claimed[(kw["session_id"], kw["last_message_id"])] = "failed"
+        self.marks.append(("failed", kw))
+
+    def pending_dispatch(self):
+        return [{"session_id": sid, "last_message_id": last,
+                 "payload": self.payloads.get((sid, last), [])}
+                for (sid, last), status in self.claimed.items() if status == "extracted"]
+
     def record_run(self, **kw): self.marks.append(("run", kw))
 
 
@@ -1218,21 +1297,54 @@ def test_a_lost_claim_skips_the_llm_call_entirely(hermes_db):
     pg = FakePg(claimed={("s", 12)})
     calls = []
     deps, _, _ = make_deps(hermes_db(sessions=sessions, messages=messages), pg)
-    deps = deps._replace(extract=lambda t: calls.append(t) or []) \
-        if hasattr(deps, "_replace") else deps
     deps.extract = lambda t: calls.append(t) or []
     result = sw.sweep(deps, CFG)
     assert calls == []
     assert result["extracted"] == 0
 
 
-def test_low_scoring_chatter_is_claimed_but_not_extracted(hermes_db):
+def test_low_scoring_chatter_is_consumed_so_it_is_never_offered_twice(hermes_db):
     now = time.time()
     path = hermes_db(sessions=[SESSION("s", last_activity_at=now - 2 * HOUR, message_count=2)],
                      messages=[MSG(1, "s", "user", "hi"), MSG(2, "s", "assistant", "hello")])
-    deps, written, jobs = make_deps(path, FakePg())
+    pg = FakePg()
+    deps, written, jobs = make_deps(path, pg)
     result = sw.sweep(deps, CFG)
     assert result["entries"] == 0 and written == [] and jobs == []
+    # The watermark must advance, or every sweep forever re-reads the same chatter
+    # and pays a claim for it.
+    assert pg.watermarks() == {"s": 2}
+    deps2, _, _ = make_deps(path, pg)
+    assert sw.sweep(deps2, CFG)["candidates"] == 0
+
+
+def test_a_slice_that_failed_to_dispatch_goes_out_on_the_next_sweep(hermes_db):
+    now = time.time()
+    sessions, messages = rich_session(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = FakePg()
+
+    def boom(job, *args, job_id):
+        raise RuntimeError("valkey down")
+
+    deps, _, _ = make_deps(path, pg, enqueue=boom)
+    sw.sweep(deps, CFG)
+    assert pg.pending_dispatch(), "the slice must remain dispatchable"
+
+    sent = []
+
+    def ok(job, *args, job_id):
+        sent.append(job_id)
+        return job_id
+
+    deps2, _, _ = make_deps(path, pg, enqueue=ok)
+    result = sw.sweep(deps2, CFG)
+    # Same job id as the first attempt: arq dedups, so a double delivery is a
+    # no-op rather than a second copy in Qdrant.
+    assert sent == [sw.job_id("s", 12, 0)]
+    assert result["redispatched"] == 1
+    # And no second LLM call was paid for.
+    assert result["extracted"] == 0
 
 
 def test_dispatch_failure_leaves_the_slice_re_runnable(hermes_db):
@@ -1324,11 +1436,38 @@ def entry_suffix(session_id: str, last_message_id: int, index: int) -> str:
     return hashlib.sha256(raw).hexdigest()[:8]
 
 
+def redispatch(deps: Deps) -> int:
+    """Send jobs for slices that were extracted but never dispatched.
+
+    This is the other half of the ordering guarantee. Publishing before
+    dispatching means a broker outage cannot lose an entry — but only if
+    something comes back for it. The payload was stored with the claim, so this
+    costs no LLM call.
+    """
+    sent = 0
+    for row in deps.pg.pending_dispatch():
+        job_ids = []
+        try:
+            for item in row["payload"]:
+                deps.enqueue("process_ingestion", item["text"], "session",
+                             job_id=item["job_id"])
+                job_ids.append(item["job_id"])
+        except Exception as exc:
+            logger.warning("re-dispatch of %s:%s failed: %s",
+                           row["session_id"], row["last_message_id"], exc)
+            continue
+        deps.pg.mark_published(session_id=row["session_id"],
+                               last_message_id=row["last_message_id"], jobs=job_ids)
+        sent += 1
+    return sent
+
+
 def sweep(deps: Deps, cfg: dict) -> dict:
     now = deps.now()
     deps.pg.ensure_schema()
+    stats = {"candidates": 0, "extracted": 0, "entries": 0, "jobs": 0,
+             "redispatched": redispatch(deps)}
     marks = deps.pg.watermarks()
-    stats = {"candidates": 0, "extracted": 0, "entries": 0, "jobs": 0}
 
     with hermes_state.snapshot(deps.sqlite_conn):
         candidates = hermes_state.find_candidates(
@@ -1365,8 +1504,11 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                 continue
             entries = deps.extract(extraction.build_transcript(messages, context=context))
             stats["extracted"] += 1
+            payload = [{"job_id": job_id(cand.session_id, last_id, i), "text": e["content"]}
+                       for i, e in enumerate(entries)]
             deps.pg.mark_extracted(session_id=cand.session_id, last_message_id=last_id,
-                                   entries=len(entries), score=score["total"])
+                                   entries=len(entries), score=score["total"],
+                                   payload=payload)
             job_ids = []
             for i, entry in enumerate(entries):
                 deps.write_entry(entry_type=entry["type"], content=entry["content"],
@@ -1383,6 +1525,10 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                                    jobs=job_ids)
         except Exception as exc:                    # one bad slice must not stop the sweep
             logger.warning("slice %s:%s failed: %s", cand.session_id, last_id, exc)
+            # Without this the row stays 'claimed', watermarks() counts it, and the
+            # slice is never offered again — one conversation lost per failure.
+            deps.pg.mark_failed(session_id=cand.session_id, last_message_id=last_id,
+                                error=exc)
     return stats
 ```
 
@@ -1434,6 +1580,7 @@ def test_register_lineage_is_keyword_only():
 
 def test_on_session_end_does_not_extract(monkeypatch):
     from icarus import hooks, state
+    state.exchanges.clear()          # module-level list: leaks between tests
     called = []
     monkeypatch.setattr(hooks, "extract_entries", lambda *a, **k: called.append(1) or [])
     monkeypatch.setattr(state, "write_entry", lambda *a, **k: called.append(1))
@@ -1448,7 +1595,9 @@ def test_search_qdrant_registers_lineage(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "scripts.context_enhancer",
                         _fake_enhancer(seen))
     hooks._search_qdrant("what did we decide about X", top_k=2)
-    assert seen["session_id"] is not None
+    # state.session_id is set by on_session_start; in a bare test process it is
+    # "" and the hook substitutes "unknown". Either is acceptable, empty is not.
+    assert seen["session_id"]
     assert seen["retrieved_chunk_ids"] == ["c1"]
 
 
@@ -1508,7 +1657,8 @@ def on_session_end(session_id="", platform="", completed=False, **kwargs):
     state.write_memory_file(creative)
 ```
 
-`icarus/hooks.py`, inside `_search_qdrant`, after `search_with_fallback` returns:
+`icarus/hooks.py` gains `import hashlib` at module level (it has none today), and inside
+`_search_qdrant`, after `search_with_fallback` returns:
 
 ```python
         from scripts.context_enhancer import register_lineage
