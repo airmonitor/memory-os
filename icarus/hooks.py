@@ -1,6 +1,5 @@
 """Lifecycle hooks — memory capture, decision detection, creative tracking."""
 
-import json
 import logging
 import os
 import re
