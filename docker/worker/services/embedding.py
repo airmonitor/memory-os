@@ -55,6 +55,12 @@ async def get_embedding(text: str) -> list[float]:
     api_key = config.litellm.api_key or ""
     model = config.litellm.models.embedding.name
     expected_dims = int(config.litellm.models.embedding.dimensions)
+    # Must exceed the proxy's upstream timeout plus one fallback hop, or we hang
+    # up before LiteLLM can fail over — see the comment on this key in
+    # config/services.yaml. getattr covers an older config file with no such
+    # key; the `or` covers EMBEDDING_TIMEOUT being *set but empty*, which the
+    # loader interpolates to "" and float("") would raise on.
+    timeout = float(getattr(config.litellm.models.embedding, "timeout", None) or 100)
 
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -66,7 +72,7 @@ async def get_embedding(text: str) -> list[float]:
         "dimensions": expected_dims,  # OpenAI-style; local servers may ignore
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
             f"{base_url}/embeddings",
             headers=headers,

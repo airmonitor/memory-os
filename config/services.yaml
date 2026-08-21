@@ -41,6 +41,20 @@ litellm:
       name: ${EMBEDDING_MODEL:rapid-mlx-qwen3-embedding-8b}
       dimensions: ${EMBEDDING_DIMENSIONS:4096}
       context_length: ${EMBEDDING_CONTEXT_LENGTH:32768}
+      # Client-side HTTP budget for one /embeddings call, seconds. MUST stay
+      # above the proxy's own upstream timeout plus one fallback hop, or the
+      # client hangs up before the proxy can fail over and the fallback is
+      # unreachable. As of 2026-08-21 LiteLLM gives the local Mac Studio
+      # deployment (rapid-mlx-qwen3-embedding-8b) 80 s and the OpenRouter
+      # fallback answers in ~5 s, so a successful failover costs ~85 s and 100
+      # is the smallest safe value.
+      #
+      # It used to be a hardcoded 60 in services/embedding.py, which is below
+      # that sum: 12 of 88 reflection runs on memory-os-tom over 200 h died as
+      # `cron:process_reflection failed, ReadTimeout` at ~60 s while a working
+      # OpenRouter answer sat one unreachable hop away. Raise the proxy's
+      # timeout and you must raise this one with it.
+      timeout: ${EMBEDDING_TIMEOUT:100}
     chat:
       name: ${CHAT_MODEL:lm-studio-qwen3.6}
       max_tokens: 4096
