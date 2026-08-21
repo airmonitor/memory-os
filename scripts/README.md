@@ -10,6 +10,12 @@ Standalone Python scripts that maintain Postgres / Qdrant / Valkey and the wiki 
 | `db.py` | `get_conn()` — sync psycopg helper. Reads DSN from `config.postgres`. Used by `context_enhancer.py`, `reflection_trigger.py`, `migrate_to_postgres.py`. | Library — import only |
 | `migrate_to_postgres.py` | One-shot copy of `lineage` + `reflection_budget` from a legacy `state.db` SQLite into Postgres. Idempotent (`ON CONFLICT DO NOTHING/UPDATE`). | Once during migration |
 
+## Session Extraction
+
+| Script | What it does | Run |
+|--------|-------------|-----|
+| `session_sweeper.py` | Extracts quiet conversations from Hermes state.db into fabric entries, writes them to disk, and enqueues for Qdrant ingestion. Crash-safe: claim-before-extract and deterministic filenames prevent duplicates. Skips low-quality slices; records every run in `sweeper_status`. | Every 15 min cron |
+
 ## Qdrant Maintenance
 
 | Script | What it does | Run |
