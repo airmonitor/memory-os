@@ -1,5 +1,6 @@
 """Lifecycle hooks — memory capture, decision detection, creative tracking."""
 
+import hashlib
 import logging
 import os
 import re
@@ -26,19 +27,13 @@ except ImportError:
         _svc = None  # config absent → fall back to env at call time
 
 # ── LiteLLM extraction config ──
-_LITELLM_KEY = (_svc.litellm.api_key if _svc else os.environ.get("LITELLM_API_KEY", "")) or ""
-_LITELLM_URL = (_svc.litellm.base_url if _svc else os.environ.get("LITELLM_URL", "")).rstrip("/")
+# Only the model name survives here: extraction itself (and the rest of this
+# block — key, url, max_tokens, timeout) moved to scripts/session_sweeper.py.
+# _EXTRACTION_MODEL is kept because _search_qdrant's lineage write records it
+# as generation_model.
 _EXTRACTION_MODEL = (
     _svc.litellm.models.extraction.name if _svc
     else os.environ.get("ICARUS_EXTRACTION_MODEL", "lm-studio-qwen3.6")
-)
-_EXTRACTION_MAX_TOKENS = int(
-    _svc.litellm.models.extraction.max_tokens if _svc
-    else os.environ.get("ICARUS_EXTRACTION_MAX_TOKENS", "4096")
-)
-_EXTRACTION_TIMEOUT = int(
-    _svc.litellm.models.extraction.timeout if _svc
-    else os.environ.get("EXTRACTION_TIMEOUT", "100")
 )
 
 logger = logging.getLogger(__name__)
@@ -46,19 +41,6 @@ logger = logging.getLogger(__name__)
 # ── Truncation limits (env-configurable) ──
 _RESULT_MAX = int(os.environ.get("ICARUS_RESULT_MAX_CHARS", "500"))
 _TASK_MAX = int(os.environ.get("ICARUS_TASK_MAX_CHARS", "300"))
-
-# ── System injection detection ──
-_SYSTEM_PREFIXES = (
-    "[IMPORTANT:",
-    "[SYSTEM:",
-    "You are running as a scheduled",
-)
-
-
-def _is_system_injection(text):
-    """Return True if text starts with a known orchestrator/system preamble."""
-    stripped = text.strip()
-    return any(stripped.startswith(p) for p in _SYSTEM_PREFIXES)
 
 # use shared regexes from state for decision/outcome/completion detection
 # keep local regexes only for creative tracking (broader set)
@@ -238,9 +220,27 @@ def _search_qdrant(query, top_k=2, threshold=0.72):
             top_k=top_k,
             score_threshold=threshold,
         )
-        return results
     except Exception:
         return []
+
+    # Lineage is telemetry, not part of recall: its own try/except, entirely
+    # inside this function's success path, so a failure here — including the
+    # import itself failing on a version-skewed context_enhancer — can never
+    # cause the results already retrieved above to be discarded.
+    try:
+        from scripts.context_enhancer import register_lineage
+        register_lineage(
+            session_id=state.session_id or "unknown",
+            query=query,
+            retrieved_chunk_ids=[str(r.get("id")) for r in results],
+            generation_context_hash=hashlib.sha256(
+                "".join(str(r.get("id")) for r in results).encode()).hexdigest()[:16],
+            generation_model=_EXTRACTION_MODEL or "unknown",
+        )
+    except Exception as exc:      # lineage is telemetry; recall must not depend on it
+        logger.debug("icarus: lineage write skipped: %s", exc)
+
+    return results
 
 
 # ── Session history search (FTS5 over state.db) ──────────────
@@ -626,102 +626,15 @@ def post_llm_call(session_id="", user_message="", assistant_response="", platfor
         state.save_creative(creative)
 
 
-def _legacy_session_write(platform, scores):
-    """Fallback: original truncated session write (pre-LLM behavior)."""
-    plat = platform or "cli"
-    parts = []
-
-    first_user = next(
-        (
-            ex["user"] for ex in state.exchanges
-            if len(ex.get("user", "").strip()) > 50
-            and not _is_system_injection(ex.get("user", ""))
-        ),
-        None
-    )
-    if first_user:
-        parts.append(f"## Task\n{first_user[:_TASK_MAX]}")
-
-    for ex in state.exchanges:
-        resp = ex.get("assistant", "")
-        if state.DECISION_RE.search(resp) and len(resp) > 100:
-            parts.append(f"## Decision\n{resp[:500]}")
-            break
-
-    substantive = [ex for ex in state.exchanges if len(ex.get("assistant", "").strip()) > 100]
-    if substantive:
-        parts.append(f"## Result\n{substantive[-1]['assistant'][:_RESULT_MAX]}")
-
-    content = "\n\n".join(parts) if parts else state.exchanges[-1].get("assistant", "")[:500]
-
-    if substantive:
-        result_text = substantive[-1]['assistant']
-    else:
-        result_text = content
-    summary = re.sub(r"\s+", " ", result_text.replace("\n", " ")).strip()[:80]
-    summary = re.sub(r"-{2,}", "—", summary)  # sanitize: prevent YAML frontmatter breakage
-
-    if scores["total"] >= 0.6:
-        tv = "high"
-    elif scores["total"] >= 0.3:
-        tv = "normal"
-    else:
-        tv = "low"
-
-    state.write_entry("session", content, summary, platform=plat,
-                     training_value=tv, status="completed")
-
-
 def on_session_end(session_id="", platform="", completed=False, **kwargs):
-    """Score session, extract entries via LLM, fall back to legacy truncation."""
+    """Persist the creative memory file. EXTRACTION NO LONGER HAPPENS HERE.
+
+    On hermes_agent 0.20.4 this hook fires once per user message
+    (agent/turn_finalizer.py:812), and `state.exchanges` is module-level, so in
+    gateway mode it also blends concurrent Slack threads into one list. Session
+    extraction moved to scripts/session_sweeper.py, which reads the
+    authoritative transcript out of Hermes' own state.db.
+    See docs/adr/0001-session-extraction-via-state-db-sweeper.md.
+    """
     creative = state.load_creative()
     state.write_memory_file(creative)
-
-    if not state.exchanges:
-        return
-
-    scores = state.score_session()
-    if scores["total"] < 0.2:
-        return
-
-    plat = platform or "cli"
-
-    # ── LLM extraction (primary) ──
-    # Inline transcript rendering: state.exchanges is a list of {user, assistant}
-    # dicts built up live by this plugin's own hooks — NOT the raw Message
-    # objects extraction.build_transcript() expects (that helper is for the
-    # sweeper, which reads finished conversations straight out of state.db).
-    # Same shape/truncation the deleted _build_transcript used.
-    transcript_lines = []
-    for i, ex in enumerate(state.exchanges):
-        user = (ex.get("user") or "").strip()
-        assistant = (ex.get("assistant") or "").strip()
-        if user:
-            transcript_lines.append(f"[Turn {i+1} — User]\n{user[:500]}")
-        if assistant:
-            transcript_lines.append(f"[Turn {i+1} — Agent]\n{assistant[:800]}")
-    transcript = "\n\n".join(transcript_lines)
-    entries = extract_entries(
-        transcript,
-        base_url=_LITELLM_URL,
-        api_key=_LITELLM_KEY,
-        model=_EXTRACTION_MODEL,
-        max_tokens=_EXTRACTION_MAX_TOKENS,
-        timeout=_EXTRACTION_TIMEOUT,
-    )
-
-    if entries:
-        for entry in entries:
-            state.write_entry(
-                entry["type"],
-                entry["content"],
-                entry["summary"],
-                platform=plat,
-                training_value=entry.get("training_value", "normal"),
-                status="completed"
-            )
-        logger.info("icarus: LLM extracted %d entries from session", len(entries))
-    else:
-        # ── Legacy fallback ──
-        logger.info("icarus: LLM extraction produced nothing — using legacy truncation")
-        _legacy_session_write(platform, scores)
