@@ -26,7 +26,16 @@ _TOOL_NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
 
 USER_MAX, ASSISTANT_MAX, TOOL_MAX = 500, 800, 300
 
-REQUIRED_FIELDS = ("type", "summary", "content")
+# The old allowlist (decision, resolution, note) predates readers that also
+# branch on code-session/task/review/research. An entry outside this union
+# is not dropped — it is kept with its type rewritten to "note" (see
+# _validate_entries) because a mis-typed memory is recoverable and a dropped
+# one is not.
+ALLOWED_TYPES = {"decision", "resolution", "note", "code-session", "task",
+                 "review", "research"}
+_MIN_SUMMARY_LEN = 10
+_MIN_CONTENT_LEN = 60
+_SUMMARY_MAX, _CONTENT_MAX = 80, 2000
 
 # Verbatim copy of the prompt from hooks.py:_llm_extract_entries — the move to
 # this module must not change extraction behaviour.
@@ -123,21 +132,72 @@ def score_exchanges(exchanges, *, recall_usage: float = 0.0, linked_entries: int
     return scores
 
 
+def _unwrap(parsed):
+    """Normalise a parsed JSON value into a list of entry dicts.
+
+    Handles the shapes some models return instead of a bare array:
+    {"entries": [...]}, {"results": [...]}, or a single entry object
+    ({"type": ..., ...}) — which becomes a one-element list rather than
+    being dropped, since a bare-object response is a real extraction, not
+    noise.
+    """
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        for key in ("entries", "results"):
+            if key in parsed and isinstance(parsed[key], list):
+                return parsed[key]
+        if "type" in parsed:
+            return [parsed]
+    return []
+
+
 def parse_json_robust(raw):
-    """Extract a JSON array from LLM output, tolerating markdown fences."""
+    """Extract entries from LLM output, tolerating markdown fences and dict wrappers."""
     if raw is None:
         return []
     text = raw.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S)
-    start, end = text.find("["), text.rfind("]")
-    if start == -1 or end <= start:
+    start_list, start_obj = text.find("["), text.find("{")
+    # Prefer whichever top-level bracket appears first — an object wrapper
+    # like {"entries": [...]} has its own "[" nested inside, after the "{".
+    if start_list != -1 and (start_obj == -1 or start_list < start_obj):
+        start, end = start_list, text.rfind("]")
+    elif start_obj != -1:
+        start, end = start_obj, text.rfind("}")
+    else:
+        return []
+    if end <= start:
         return []
     try:
         parsed = json.loads(text[start:end + 1])
     except json.JSONDecodeError:
         return []
-    return parsed if isinstance(parsed, list) else []
+    return _unwrap(parsed)
+
+
+def _validate_entries(entries):
+    """Drop entries too short to be useful; normalise type/training_value; truncate."""
+    valid = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        summary = (entry.get("summary") or "").strip()
+        content = (entry.get("content") or "").strip()
+        if len(summary) < _MIN_SUMMARY_LEN or len(content) < _MIN_CONTENT_LEN:
+            continue
+        etype = entry.get("type")
+        if etype not in ALLOWED_TYPES:
+            logger.warning("icarus: unknown extraction type %r — rewritten to 'note'", etype)
+            etype = "note"
+        valid.append({
+            "type": etype,
+            "summary": summary[:_SUMMARY_MAX],
+            "content": content[:_CONTENT_MAX],
+            "training_value": entry.get("training_value") or "normal",
+        })
+    return valid
 
 
 def extract_entries(transcript, *, base_url, api_key, model, max_tokens, timeout,
@@ -162,5 +222,4 @@ def extract_entries(transcript, *, base_url, api_key, model, max_tokens, timeout
     except Exception as exc:                      # fail-open: memory never breaks a turn
         logger.warning("icarus: extraction call failed: %s", exc)
         return []
-    return [e for e in entries
-            if isinstance(e, dict) and all(e.get(f) for f in REQUIRED_FIELDS)]
+    return _validate_entries(entries)
