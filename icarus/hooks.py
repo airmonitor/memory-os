@@ -5,12 +5,11 @@ import logging
 import os
 import re
 import sys
-import urllib.request
-import urllib.error
 from datetime import datetime
 from pathlib import Path
 
 from . import state
+from .extraction import build_transcript, extract_entries, parse_json_robust  # noqa: F401
 
 # ── Service config (config/services.yaml) ─────────────────────────────────
 # Fall back to a local repo when running from a checkout instead of the Hermes
@@ -37,6 +36,10 @@ _EXTRACTION_MODEL = (
 _EXTRACTION_MAX_TOKENS = int(
     _svc.litellm.models.extraction.max_tokens if _svc
     else os.environ.get("ICARUS_EXTRACTION_MAX_TOKENS", "4096")
+)
+_EXTRACTION_TIMEOUT = int(
+    _svc.litellm.models.extraction.timeout if _svc
+    else os.environ.get("EXTRACTION_TIMEOUT", "100")
 )
 
 logger = logging.getLogger(__name__)
@@ -624,160 +627,6 @@ def post_llm_call(session_id="", user_message="", assistant_response="", platfor
         state.save_creative(creative)
 
 
-# ── LLM-powered session extraction ────────────────────────
-
-def _parse_json_robust(raw):
-    """Extract JSON array/object from LLM output with markdown tolerances.
-
-    Handles: ```json fences, leading text, trailing commas, whitespace.
-    Returns parsed value on success, None on failure.
-    """
-    if not raw or not raw.strip():
-        return None
-
-    text = raw.strip()
-
-    # Strip markdown code fences
-    for fence in ("```json", "```"):
-        if text.startswith(fence):
-            text = text[len(fence):].lstrip()
-        if text.endswith("```"):
-            text = text[:-3].rstrip()
-
-    # Find first JSON structure character
-    for start_char in ("[", "{"):
-        idx = text.find(start_char)
-        if idx != -1:
-            text = text[idx:]
-            break
-
-    # Attempt parse; progressively strip trailing characters on failure
-    attempts = 0
-    while attempts < 20:
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            # Strip last char and try again (handles trailing commas, extra })
-            if text:
-                text = text[:-1]
-            attempts += 1
-            continue
-
-    return None
-
-
-def _build_transcript(exchanges):
-    """Build a compact transcript from session exchanges for LLM analysis."""
-    lines = []
-    for i, ex in enumerate(exchanges):
-        user = (ex.get("user") or "").strip()
-        assistant = (ex.get("assistant") or "").strip()
-        if user:
-            lines.append(f"[Turn {i+1} — User]\n{user[:500]}")
-        if assistant:
-            lines.append(f"[Turn {i+1} — Agent]\n{assistant[:800]}")
-    return "\n\n".join(lines)
-
-
-def _llm_extract_entries(transcript):
-    """Use LLM to extract significant entries from session transcript.
-
-    Returns list of dicts: {type, summary, content, training_value}
-    Returns empty list on failure or if nothing worth preserving.
-    """
-    if not _LITELLM_KEY:
-        logger.warning("icarus: no LiteLLM key — skipping LLM extraction")
-        return []
-
-    prompt = (
-        "You are a session archivist for an AI agent. Analyze this agent session "
-        "transcript and extract ONLY significant entries worth preserving in a "
-        "cross-agent knowledge base. Skip trivial sessions, greetings, and routine chatter.\n\n"
-        "For each significant entry, provide:\n"
-        "- type: \"decision\" (technical decision with rationale), "
-        "\"resolution\" (bug fix or problem solved), "
-        "or \"note\" (discovery or learning)\n"
-        "- summary: one line, max 80 chars, in the original language of the session\n"
-        "- content: structured markdown with ## Context, ## Action/Decision, and ## Outcome. "
-        "Include concrete details: commands, paths, error messages, decisions made.\n"
-        "- training_value: \"high\" (outcome verified, artifact produced, decision with evidence), "
-        "\"normal\" (useful context or progress), "
-        "or \"low\" (marginal, but not zero)\n\n"
-        "If the session contains NOTHING worth preserving across sessions, "
-        "return an empty array: []\n\n"
-        "Return ONLY valid JSON array, no other text:\n"
-        '[{"type": "decision", "summary": "...", "content": "...", "training_value": "high"}, ...]'
-    )
-
-    payload = json.dumps({
-        "model": _EXTRACTION_MODEL,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": transcript[:8000]}
-        ],
-        "max_tokens": _EXTRACTION_MAX_TOKENS,
-        "temperature": 0.2
-    }).encode("utf-8")
-
-    try:
-        url = f"{_LITELLM_URL}/chat/completions" if _LITELLM_URL else "https://litellm.airmonitor.pl/v1/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if _LITELLM_KEY:
-            headers["Authorization"] = f"Bearer {_LITELLM_KEY}"
-        req = urllib.request.Request(url, data=payload, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=45)
-        body = json.loads(resp.read().decode("utf-8"))
-        raw = body["choices"][0]["message"]["content"]
-
-        # Parse JSON from response (robust — handles markdown fences, null)
-        if raw is None:
-            raise ValueError("DeepSeek returned content:null (response_format bug)")
-        extracted = _parse_json_robust(raw)
-        if isinstance(extracted, dict):
-            # Some models return {entries: [...]} — unwrap
-            for key in ("entries", "results", "items"):
-                if key in extracted and isinstance(extracted[key], list):
-                    extracted = extracted[key]
-                    break
-            else:
-                # Single entry wrapped in dict
-                if "type" in extracted:
-                    extracted = [extracted]
-                else:
-                    extracted = []
-
-        if not isinstance(extracted, list):
-            logger.warning("icarus: LLM extraction returned non-list: %s", type(extracted))
-            return []
-
-        # Validate and filter
-        valid = []
-        allowed_types = {"decision", "resolution", "note"}
-        for entry in extracted:
-            if not isinstance(entry, dict):
-                continue
-            etype = entry.get("type", "")
-            summary = entry.get("summary", "")
-            content = entry.get("content", "")
-            if etype not in allowed_types:
-                continue
-            if len(summary) < 10 or len(content) < 60:
-                continue
-            valid.append({
-                "type": etype,
-                "summary": summary[:80],
-                "content": content[:2000],
-                "training_value": entry.get("training_value", "normal")
-            })
-
-        return valid
-
-    except (urllib.error.URLError, json.JSONDecodeError, KeyError, IndexError, ValueError,
-            ConnectionError, TimeoutError, OSError) as e:
-        logger.warning("icarus: LLM extraction failed (%s) — falling back to legacy", type(e).__name__)
-        return []
-
-
 def _legacy_session_write(platform, scores):
     """Fallback: original truncated session write (pre-LLM behavior)."""
     plat = platform or "cli"
@@ -839,8 +688,28 @@ def on_session_end(session_id="", platform="", completed=False, **kwargs):
     plat = platform or "cli"
 
     # ── LLM extraction (primary) ──
-    transcript = _build_transcript(state.exchanges)
-    entries = _llm_extract_entries(transcript)
+    # Inline transcript rendering: state.exchanges is a list of {user, assistant}
+    # dicts built up live by this plugin's own hooks — NOT the raw Message
+    # objects extraction.build_transcript() expects (that helper is for the
+    # sweeper, which reads finished conversations straight out of state.db).
+    # Same shape/truncation the deleted _build_transcript used.
+    transcript_lines = []
+    for i, ex in enumerate(state.exchanges):
+        user = (ex.get("user") or "").strip()
+        assistant = (ex.get("assistant") or "").strip()
+        if user:
+            transcript_lines.append(f"[Turn {i+1} — User]\n{user[:500]}")
+        if assistant:
+            transcript_lines.append(f"[Turn {i+1} — Agent]\n{assistant[:800]}")
+    transcript = "\n\n".join(transcript_lines)
+    entries = extract_entries(
+        transcript,
+        base_url=_LITELLM_URL,
+        api_key=_LITELLM_KEY,
+        model=_EXTRACTION_MODEL,
+        max_tokens=_EXTRACTION_MAX_TOKENS,
+        timeout=_EXTRACTION_TIMEOUT,
+    )
 
     if entries:
         for entry in entries:

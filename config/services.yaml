@@ -62,6 +62,10 @@ litellm:
     extraction:                      # icarus/hooks.py LLM extraction
       name: ${EXTRACTION_MODEL:lm-studio-qwen3.6}
       max_tokens: ${ICARUS_EXTRACTION_MAX_TOKENS:4096}
+      # Client budget for one extraction call. Same rule as the embedding
+      # timeout above: it must exceed the proxy's own upstream timeout plus one
+      # fallback hop, or we hang up before LiteLLM can fail over.
+      timeout: ${EXTRACTION_TIMEOUT:100}
 
 paths:                               # SQLite + local paths — host-specific, set in .env
   hermes_home: ${HERMES_HOME}
