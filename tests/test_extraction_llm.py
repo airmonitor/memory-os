@@ -106,13 +106,18 @@ def test_a_response_that_is_not_a_chat_completion_raises():
                                    max_tokens=10, timeout=5, opener=wrong_shape)
 
 
-def test_entries_dropped_by_validation_are_not_a_failure():
-    """The model was asked and it answered; the answer was junk. That is
-    "nothing worth keeping", not "the call did not happen"."""
+def test_all_entries_dropped_by_validation_is_a_deterministic_failure():
+    """This flipped in the failure-classification round (fix round 1): ADR-0002
+    decision 4 defines the deterministic class as "could not be parsed OR
+    VALIDATED". A non-empty parse that validation drops entirely used to
+    return `[]`, indistinguishable from the model genuinely saying there was
+    nothing here — now it raises, and only a genuinely empty parse still
+    returns `[]` silently (see test_a_genuine_empty_array_is_still_an_empty_list)."""
     raw = json.dumps([{"type": "decision", "summary": "x", "content": "y"}])
-    assert extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
-                                      max_tokens=10, timeout=5,
-                                      opener=fake_opener(raw)) == []
+    with pytest.raises(ExtractionFailed) as exc:
+        extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
+                                   max_tokens=10, timeout=5, opener=fake_opener(raw))
+    assert exc.value.transient is False
 
 
 def test_parse_json_robust_stays_lenient_for_the_plugin_surface():
@@ -170,18 +175,22 @@ def test_a_bare_single_object_is_unwrapped():
     assert out == [_entry()]
 
 
-def test_a_too_short_summary_is_dropped():
+def test_a_too_short_summary_makes_the_only_entry_fail_validation():
+    """The batch is a single entry, so dropping it drops everything — the
+    deterministic-failure shape (fix round 1), not a silent empty result."""
     raw = json.dumps([_entry(summary="short")])
-    out = extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
-                                     max_tokens=10, timeout=5, opener=fake_opener(raw))
-    assert out == []
+    with pytest.raises(ExtractionFailed) as exc:
+        extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
+                                   max_tokens=10, timeout=5, opener=fake_opener(raw))
+    assert exc.value.transient is False
 
 
-def test_too_short_content_is_dropped():
+def test_too_short_content_makes_the_only_entry_fail_validation():
     raw = json.dumps([_entry(content="too short")])
-    out = extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
-                                     max_tokens=10, timeout=5, opener=fake_opener(raw))
-    assert out == []
+    with pytest.raises(ExtractionFailed) as exc:
+        extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
+                                   max_tokens=10, timeout=5, opener=fake_opener(raw))
+    assert exc.value.transient is False
 
 
 def test_an_overlong_summary_and_content_are_truncated():

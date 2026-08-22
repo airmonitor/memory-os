@@ -215,8 +215,12 @@ def sweep(deps: Deps, cfg: dict) -> dict:
     # track EVERY deterministic failure this run, by distinct session id: two
     # different sessions failing deterministically in one run is what a
     # misrouting gateway looks like, since its HTTP-200 door is indistinguishable
-    # per slice from a model that genuinely wrote nonsense. Both breakers share
-    # `cfg["transient_abort"]` as their threshold (ADR-0002: "on both classes").
+    # per slice from a model that genuinely wrote nonsense. The two breakers
+    # have SEPARATE thresholds (`cfg["transient_abort"]` and
+    # `cfg["deterministic_sessions_abort"]`, fix round 1) — sharing one key
+    # meant raising it to tolerate a flakier network also raised
+    # `max_per_run`'s ceiling on how many distinct sessions a single run can
+    # ever touch, silently disabling the systemic-gateway protection.
     transient_streak = 0
     det_sessions: set[str] = set()
     det_rows: list[tuple[str, int]] = []
@@ -259,13 +263,12 @@ def sweep(deps: Deps, cfg: dict) -> dict:
         # sweep, so a raise here is logged and this slice is skipped — it will
         # be offered again on the next sweep, since nothing was claimed.
         #
-        # count_attempt=False: claiming ownership of a slice is not yet
-        # attempting it. Only a classified deterministic failure (below) counts
-        # against the ceiling.
+        # Claiming ownership of a slice is not yet attempting it — claim()
+        # never touches `attempts`. Only a classified deterministic failure
+        # (below, via mark_failed) counts against the ceiling.
         try:
             won = deps.pg.claim(session_id=cand.session_id, first_message_id=first_id,
-                                last_message_id=last_id, message_count=len(messages),
-                                count_attempt=False)
+                                last_message_id=last_id, message_count=len(messages))
         except Exception as exc:
             logger.warning("claim for slice %s:%s failed: %s", cand.session_id, last_id, exc)
             continue
@@ -323,7 +326,7 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                                            error=exc, count_attempt=True)
             det_rows.append((cand.session_id, last_id))
             det_sessions.add(cand.session_id)
-            if len(det_sessions) >= cfg["transient_abort"]:
+            if len(det_sessions) >= cfg["deterministic_sessions_abort"]:
                 # Systemic, not three bad slices: a misrouting gateway answers
                 # every slice's request with an unusable-but-200 body, and
                 # that is indistinguishable per slice from a model that wrote
@@ -336,6 +339,15 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                     "(ADR-0002 decision 4)", len(det_sessions))
                 for r_sid, r_last in det_rows:
                     deps.pg.rollback_attempt(session_id=r_sid, last_message_id=r_last)
+                # Every quarantine this run recorded came from one of the rows
+                # just rolled back — `det_rows` holds EVERY deterministic
+                # failure this run, and all of them are refunded above. Zeroing
+                # (not decrementing) is correct because there is no other
+                # source `stats["quarantined"]` could have been incremented
+                # from. Leaving it non-zero would report a slice as retired
+                # when its row is back to plain 'failed' (fix round 1,
+                # "phantom quarantine").
+                stats["quarantined"] = 0
                 stats["aborted"] = True
                 break
             if attempts >= cfg["max_attempts"]:
@@ -348,6 +360,14 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                            cand.session_id, last_id, exc)
             deps.pg.mark_failed(session_id=cand.session_id, last_message_id=last_id,
                                 error=exc, count_attempt=False)
+            # Deliberate: an exception this generic isn't classified transient
+            # or deterministic, so it resets the streak rather than extending
+            # it (fix round 1, Minor 5). Known consequence — an outage that
+            # surfaces as this shape in one sweep and as a classified transient
+            # `ExtractionFailed` in the next never accumulates a streak across
+            # the two, so it can only trip the breaker if it repeats in the
+            # SAME shape consecutively. Not fixed here; recorded so the next
+            # reader doesn't mistake it for an oversight.
             transient_streak = 0
             continue
 
@@ -407,6 +427,7 @@ def _load_cfg(cfg_module) -> dict:
         quality_threshold=float(g("quality_threshold", 0.2)),
         max_attempts=int(g("max_attempts", 3)),
         transient_abort=int(g("transient_abort", 2)),
+        deterministic_sessions_abort=int(g("deterministic_sessions_abort", 2)),
     )
 
 

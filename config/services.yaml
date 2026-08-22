@@ -131,11 +131,17 @@ session_extraction:
   # transient one (a LiteLLM outage, say) never does. 3 tries for a genuinely
   # bad slice before it is quarantined.
   max_attempts: ${SESSION_MAX_ATTEMPTS:3}
-  # The run-level circuit breaker, on both classes: this many consecutive
-  # transient failures, OR deterministic failures spread across this many
-  # DIFFERENT sessions in one run, abort the sweep — either shape is a
-  # misrouting gateway, not bad slices.
+  # The run-level circuit breaker for CONSECUTIVE transient failures: this
+  # many in a row aborts the sweep — a gateway outage, not bad slices.
   transient_abort: ${SESSION_TRANSIENT_ABORT:2}
+  # The run-level circuit breaker for deterministic failures spread across
+  # DIFFERENT sessions in one run — also a misrouting-gateway shape, since its
+  # HTTP-200 door is indistinguishable per slice from a model that genuinely
+  # wrote nonsense. A SEPARATE key from transient_abort (fix round 1): sharing
+  # one meant raising it to tolerate a flakier network also raised the number
+  # of distinct sessions a run could ever touch (bounded by max_per_run),
+  # silently disabling this protection once the two crossed.
+  deterministic_sessions_abort: ${SESSION_DETERMINISTIC_SESSIONS_ABORT:2}
 
 logging:
   level: INFO

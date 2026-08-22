@@ -10,7 +10,7 @@ from tests.conftest import SESSION, MSG
 HOUR = 3600
 CFG = dict(idle_seconds=90 * 60, min_messages=2, context_overlap=2,
            max_lag_seconds=24 * HOUR, max_per_run=3, quality_threshold=0.2,
-           max_attempts=3, transient_abort=2)
+           max_attempts=3, transient_abort=2, deterministic_sessions_abort=2)
 
 
 class FakePg:
@@ -845,6 +845,37 @@ def test_deterministic_failures_in_two_different_sessions_abort_and_roll_back(he
     assert len(pg.claimed) == 2
     assert all(status == "failed" for status in pg.claimed.values())
     assert all(pg.attempts.get(key, 0) == 0 for key in pg.claimed)
+
+
+def test_a_quarantine_earlier_in_the_run_is_reverted_by_the_cross_session_breaker(hermes_db):
+    """Finding 2 (fix round 1): `rollback_attempt` un-retires every row this
+    run counted, but the run's own `stats["quarantined"]` must be reverted
+    with it — or `sweeper_status.quarantined` reports a slice as retired when
+    its row is actually back to plain 'failed'. Session `s0` sorts first
+    (older last_activity_at) and is preloaded one short of the ceiling, so its
+    slice is claimed and fails FIRST, reaching the ceiling and quarantining —
+    before `s1`'s failure trips the cross-session breaker and rolls both back."""
+    now = time.time()
+    sessions = [SESSION("s0", last_activity_at=now - 3 * HOUR, message_count=4),
+               SESSION("s1", last_activity_at=now - 2 * HOUR, message_count=4)]
+    messages = []
+    for n, sid in enumerate(("s0", "s1")):
+        base = 100 * n
+        messages.append(MSG(base + 1, sid, "user", "u" * 60))
+        messages.append(MSG(base + 2, sid, "assistant", "decided. Result: works. " + "d" * 200))
+        messages.append(MSG(base + 3, sid, "user", "u" * 60))
+        messages.append(MSG(base + 4, sid, "assistant", "decided. Result: works. " + "d" * 200))
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = FakePg()
+    pg.attempts[("s0", 4)] = CFG["max_attempts"] - 1
+    deps, _, _ = make_deps(path, pg)
+    deps.extract = deterministic_boom
+
+    result = sw.sweep(deps, CFG)
+    assert result["aborted"] is True
+    assert result["quarantined"] == 0
+    assert pg.claimed[("s0", 4)] == "failed"
+    assert pg.attempts[("s0", 4)] == CFG["max_attempts"] - 1
 
 
 def test_a_deterministic_failure_reaches_quarantine_after_max_attempts_runs(hermes_db):

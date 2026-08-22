@@ -306,12 +306,17 @@ def extract_entries(transcript, *, base_url, api_key, model, max_tokens, timeout
     """Ask the model what is worth keeping. Raise `ExtractionFailed` if asking
     did not work.
 
-    `[]` is a real answer and means "nothing worth keeping". Every other
-    outcome — no key, transport error, unreadable response, output that is not
-    JSON entries — raises, because on the sweeper path a returned `[]` consumes
-    the conversation. Entries the model produced but `_validate_entries` drops
-    are NOT a failure: the model was asked, it answered, and the answer was
-    junk. Callers that must not raise (anything on an agent's turn path) have
+    `[]` is a real answer and means "nothing worth keeping" — but only when the
+    model's own output parsed as an empty array. Every other outcome — no key,
+    transport error, unreadable response, output that is not JSON entries, or
+    JSON entries that all fail validation — raises, because on the sweeper
+    path a returned `[]` consumes the conversation. Entries the model produced
+    where SOME survive `_validate_entries` and some don't are NOT a failure:
+    the model was asked, it answered, and part of the answer was junk. Only a
+    non-empty parse that validation drops ENTIRELY is treated as a failure
+    (deterministic — see below), because that is indistinguishable from "the
+    model never usefully answered" and must not silently read as "nothing was
+    here". Callers that must not raise (anything on an agent's turn path) have
     to catch this themselves — a memory layer never breaks a turn.
     """
     if not api_key:
@@ -351,4 +356,19 @@ def extract_entries(transcript, *, base_url, api_key, model, max_tokens, timeout
         raise ExtractionFailed(
             f"extraction output was not JSON entries: {(content or '')[:200]!r}",
             transient=False)
-    return _validate_entries(parsed)
+    validated = _validate_entries(parsed)
+    if parsed and not validated:
+        # The model answered with at least one candidate entry, and every one
+        # of them failed validation (too short, malformed). ADR-0002 decision
+        # 4 defines the deterministic class as "could not be parsed OR
+        # VALIDATED" — this is the "or validated" half. Without it, this looks
+        # identical to `parsed` genuinely being empty: the sweeper reads a
+        # returned `[]` as "nothing worth keeping", marks the slice extracted
+        # and published, and the watermark advances past a conversation the
+        # model answered about but said nothing usable. `parsed` empty (the
+        # model genuinely returned `[]`) is the one shape that returns `[]`
+        # silently — it never reaches this branch.
+        raise ExtractionFailed(
+            f"extraction produced {len(parsed)} entr{'y' if len(parsed) == 1 else 'ies'} "
+            "that all failed validation", transient=False)
+    return validated

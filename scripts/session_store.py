@@ -81,7 +81,7 @@ SCHEMA = (
     # session_extraction predates `attempts` (ADR-0002 decision 4) for the same
     # reason — the migration path for an existing table is an ALTER, not the
     # CREATE above. Counts only genuine, classified-deterministic extraction
-    # failures; see mark_failed and claim.
+    # failures; see mark_failed.
     """
     ALTER TABLE session_extraction
         ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0
@@ -156,9 +156,7 @@ _CLAIM_RECLAIM_SQL = f"""
     INSERT INTO session_extraction {_CLAIM_INSERT_COLUMNS}
     VALUES (%s, %s, %s, %s)
     ON CONFLICT (session_id, last_message_id) DO UPDATE
-        SET status = 'claimed', claimed_at = now(), updated_at = now(),
-            attempts = session_extraction.attempts
-                + CASE WHEN %s THEN 1 ELSE 0 END
+        SET status = 'claimed', claimed_at = now(), updated_at = now()
         WHERE session_extraction.status = 'failed'
            OR (session_extraction.status = 'claimed'
                AND session_extraction.updated_at
@@ -199,7 +197,7 @@ def expire_stale_claims(conn, *, stale_hours=STALE_CLAIM_HOURS) -> int:
 
 
 def claim(conn, *, session_id, first_message_id, last_message_id, message_count,
-          stale_hours=None, count_attempt=True) -> bool:
+          stale_hours=None) -> bool:
     """Win the right to extract this slice. False means somebody else owns it.
 
     THE RECLAIM STEP IS NOT DECORATION. A crash between the claim and the
@@ -223,25 +221,25 @@ def claim(conn, *, session_id, first_message_id, last_message_id, message_count,
     to opt in. Passing `stale_hours` explicitly skips straight to the reclaim
     statement.
 
-    `count_attempt` (default True) governs whether reclaiming an EXISTING row
-    bumps `attempts`. The sweeper's own call always passes `count_attempt=False`
-    — grabbing ownership of a slice is not yet attempting it, and ADR-0002
-    decision 4 counts only genuine, classified-deterministic extraction
-    failures (via `mark_failed`). This keeps the guarantee true here too: a
-    crash-recovered claim (`expire_stale_claims` already turned the row
-    'failed', see that function) must not increment attempts, and this default
-    is what a caller gets if it forgets to say otherwise.
+    Claiming (this function) never touches `attempts` — grabbing ownership of
+    a slice is not yet attempting it. ADR-0002 decision 4 counts only genuine,
+    classified-deterministic extraction failures, and that counting lives
+    entirely in `mark_failed`'s `count_attempt` parameter. An earlier revision
+    threaded a `count_attempt` parameter through this function's reclaim SQL
+    too; it was removed (fix round 1) because the sweeper's only call site
+    could never pass anything but the value that means "don't count" — a
+    parameter with one legal value is worse than no parameter.
     """
     ins = (session_id, first_message_id, last_message_id, message_count)
     with conn.cursor() as cur:
         if stale_hours is not None:
-            cur.execute(_CLAIM_RECLAIM_SQL, (*ins, count_attempt, stale_hours))
+            cur.execute(_CLAIM_RECLAIM_SQL, (*ins, stale_hours))
             won = cur.fetchone() is not None
         else:
             cur.execute(_CLAIM_FAST_SQL, ins)
             won = cur.fetchone() is not None
             if not won:
-                cur.execute(_CLAIM_RECLAIM_SQL, (*ins, count_attempt, STALE_CLAIM_HOURS))
+                cur.execute(_CLAIM_RECLAIM_SQL, (*ins, STALE_CLAIM_HOURS))
                 won = cur.fetchone() is not None
     conn.commit()
     return won
