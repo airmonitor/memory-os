@@ -1,5 +1,6 @@
 import io
 import json
+import urllib.error
 import pytest
 from icarus import extraction
 
@@ -7,6 +8,12 @@ from icarus import extraction
 def raising(exc):
     def _open(req, timeout=None):
         raise exc
+    return _open
+
+
+def http_error(code, reason):
+    def _open(req, timeout=None):
+        raise urllib.error.HTTPError("http://x/v1/chat/completions", code, reason, {}, None)
     return _open
 
 
@@ -74,3 +81,44 @@ def test_a_genuine_empty_array_still_returns_silently():
     assert extraction.extract_entries(
         "t", base_url="http://x/v1", api_key="k", model="m", max_tokens=10, timeout=1,
         opener=_chat_completion_opener("[]")) == []
+
+
+# ── #17(a): a permanent 4xx must stay transient (fail-open) but be
+# distinguishable from weather, both in the exception and in the logs ──
+
+@pytest.mark.parametrize("code,reason", [(401, "Unauthorized"), (404, "Not Found")])
+def test_a_permanent_4xx_is_transient_but_flagged_as_configuration(code, reason, caplog):
+    with caplog.at_level("WARNING", logger="icarus.extraction"):
+        with pytest.raises(extraction.ExtractionFailed) as e:
+            extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
+                                       max_tokens=10, timeout=1,
+                                       opener=http_error(code, reason))
+    # Fail-open: still transient, never counted against the ceiling.
+    assert e.value.transient is True
+    assert e.value.configuration_error is True
+    assert str(code) in str(e.value)
+    assert any("configuration, not weather" in r.getMessage() for r in caplog.records)
+
+
+def test_a_429_is_transient_and_is_not_configuration_it_is_weather(caplog):
+    with caplog.at_level("WARNING", logger="icarus.extraction"):
+        with pytest.raises(extraction.ExtractionFailed) as e:
+            extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
+                                       max_tokens=10, timeout=1,
+                                       opener=http_error(429, "Too Many Requests"))
+    assert e.value.transient is True
+    assert e.value.configuration_error is False
+    assert "429" in str(e.value)
+    assert not any("configuration, not weather" in r.getMessage() for r in caplog.records)
+
+
+def test_a_500_is_transient_and_is_not_configuration_it_is_an_outage(caplog):
+    with caplog.at_level("WARNING", logger="icarus.extraction"):
+        with pytest.raises(extraction.ExtractionFailed) as e:
+            extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
+                                       max_tokens=10, timeout=1,
+                                       opener=http_error(500, "Internal Server Error"))
+    assert e.value.transient is True
+    assert e.value.configuration_error is False
+    assert "500" in str(e.value)
+    assert not any("configuration, not weather" in r.getMessage() for r in caplog.records)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import urllib.error
 import urllib.request
 
 from .sanitize import strip_mechanical
@@ -44,11 +45,24 @@ class ExtractionFailed(RuntimeError):
     — the HTTP-200 door a misrouting proxy walks through) are all transient.
     Only a gateway response that parses as a chat completion, whose MODEL
     content could not be parsed or validated, is deterministic.
+
+    `configuration_error` is a second, narrower axis inside `transient=True` —
+    it does NOT change whether the failure counts against the ceiling. A 429
+    is genuinely transient weather (the rate limit will lift); an HTTP 4xx
+    that is NOT 429 — a rotated key (401), a renamed or invalid model id
+    (404), a malformed request (400) — is not weather, it is a configuration
+    problem that will not fix itself no matter how many sweeps retry it.
+    Fail-open stays the default (a memory system must not start quarantining
+    conversations because of a typo in `config/services.yaml`), so this stays
+    `transient=True` and keeps retrying — but it is flagged so an operator can
+    see it: `session_sweeper.sweep` surfaces it as `sweeper_status.error`, the
+    one place a "the run technically succeeded" outcome is otherwise invisible.
     """
 
-    def __init__(self, message, *, transient):
+    def __init__(self, message, *, transient, configuration_error=False):
         super().__init__(message)
         self.transient = transient
+        self.configuration_error = configuration_error
 
 DECISION_RE = re.compile(
     r"(?i)\b(decided|resolved|completed|fixed|deployed|shipped|reviewed|approved|rejected)\b"
@@ -335,7 +349,24 @@ def extract_entries(transcript, *, base_url, api_key, model, max_tokens, timeout
                  "Authorization": f"Bearer {api_key}"})
     try:
         raw_body = opener(req, timeout=timeout).read().decode("utf-8")
-    except Exception as exc:                      # transport, HTTP status, decode
+    except urllib.error.HTTPError as exc:
+        # 429 is genuine weather (the rate limit will lift on its own); every
+        # other 4xx is not — see ExtractionFailed.configuration_error. 5xx
+        # stays plain transient (an outage, not a config problem), same as
+        # any other transport failure below.
+        is_configuration_error = exc.code != 429 and 400 <= exc.code < 500
+        if is_configuration_error:
+            logger.warning(
+                "icarus: extraction call got HTTP %s from the gateway — "
+                "configuration, not weather (a rotated key, a renamed or "
+                "invalid model id, a malformed request). Retrying will not "
+                "fix this on its own; the sweep stays fail-open and keeps "
+                "retrying anyway, but this needs an operator: %s",
+                exc.code, exc)
+        raise ExtractionFailed(
+            f"extraction call failed: HTTP {exc.code} {exc.reason}",
+            transient=True, configuration_error=is_configuration_error) from exc
+    except Exception as exc:                      # transport, decode, non-HTTP failures
         raise ExtractionFailed(f"extraction call failed: {exc}", transient=True) from exc
     try:
         content = json.loads(raw_body)["choices"][0]["message"]["content"]
