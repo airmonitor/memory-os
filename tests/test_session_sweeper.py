@@ -20,7 +20,15 @@ class FakePg:
 
     def __init__(self, claimed=()):
         self.claimed = {k: "published" for k in claimed}
+        # {"fn": name, "kwargs": {...}} per call, not a bare name: the retry
+        # pass is asserted on by the RANGE it claimed, and a name alone cannot
+        # tell (1..10) from (1..25).
         self.calls, self.marks, self.payloads = [], [], {}
+        # ADR-0003 decision 1: the first_message_id..last_message_id each row
+        # covers. The real table has carried both columns since it was created;
+        # the fake needs them because a failed slice is now RETRIED at its own
+        # recorded range instead of re-derived from the watermark.
+        self.ranges = {}
         # Keys whose 'claimed' row is older than STALE_CLAIM_HOURS. Wall-clock
         # ageing is what the real UPDATE does; a test says so directly.
         self.stale = set()
@@ -33,7 +41,7 @@ class FakePg:
         # the one with no ceiling, and it is what drives the backoff clock.
         self.retries = {}
 
-    def ensure_schema(self): self.calls.append("ensure_schema")
+    def ensure_schema(self): self.calls.append({"fn": "ensure_schema", "kwargs": {}})
 
     def try_session_lock(self, **kw):
         return True
@@ -54,18 +62,23 @@ class FakePg:
         return expired
 
     def watermarks(self):
+        """THE FRONTIER: every status counts, 'failed' included (ADR-0003
+        decision 2). Excluding 'failed' was how a failed slice used to be
+        offered again; the retry pass is what re-offers it now, and leaving the
+        exclusion here would let both passes claim the same messages under two
+        keys the UNIQUE constraint cannot compare."""
         out = {}
         for (sid, last), status in self.claimed.items():
-            if status == "failed":
-                continue
             out[sid] = max(out.get(sid, 0), last)
         return out
 
     def claim(self, **kw):
+        self.calls.append({"fn": "claim", "kwargs": dict(kw)})
         key = (kw["session_id"], kw["last_message_id"])
         if key in self.claimed and self.claimed[key] != "failed":
             return False
         self.claimed[key] = "claimed"
+        self.ranges[key] = (kw["first_message_id"], kw["last_message_id"])
         return True
 
     def mark_extracted(self, **kw):
@@ -102,6 +115,32 @@ class FakePg:
         return [{"session_id": sid, "last_message_id": last,
                  "payload": self.payloads.get((sid, last), [])}
                 for (sid, last), status in self.claimed.items() if status == "extracted"]
+
+    def failed_slices(self, **kw):
+        """The rows that owe an answer (ADR-0003 decision 1). 'failed' ONLY —
+        'quarantined' is terminal and must never come back here.
+
+        No backoff clock: `next_retry_at` is server time, and a fake has none to
+        keep one against. Due-ness is proven where it is actually enforced —
+        `failed_slices`' own WHERE and the claim SQL's 'failed' arm — against a
+        real PostgreSQL in tests/test_integration_postgres.py.
+        """
+        out = []
+        for (sid, last), status in self.claimed.items():
+            if status != "failed":
+                continue
+            # A row a test seeded by hand never went through claim(), so no
+            # range was recorded for it. (1, last) is what the real row would
+            # hold for a session's first slice, which is what those tests set up.
+            first, _ = self.ranges.get((sid, last), (1, last))
+            out.append({"session_id": sid, "first_message_id": first,
+                        "last_message_id": last,
+                        "attempts": self.attempts.get((sid, last), 0),
+                        "retries": self.retries.get((sid, last), 0)})
+        return out
+
+    def slice_status(self, **kw):
+        return self.claimed.get((kw["session_id"], kw["last_message_id"]))
 
     def record_run(self, **kw): self.marks.append(("run", kw))
 
@@ -320,12 +359,13 @@ def test_a_slice_that_errors_during_extraction_is_marked_failed_not_left_claimed
     deps.extract = boom_extract
     result = sw.sweep(deps, CFG)
     assert result["extracted"] == 0 and result["entries"] == 0 and result["jobs"] == 0
-    # 'claimed' counts toward watermarks() the same as any other non-failed
-    # status, so a slice stuck there would never be offered again. It must be
-    # 'failed' instead, which both excludes it from the watermark and makes it
-    # reclaimable.
+    # A slice stuck at 'claimed' would never be offered again: nothing reads
+    # 'claimed' rows. It must be 'failed' instead, which is what puts it in
+    # front of the RETRY pass. The watermark is the frontier since ADR-0003, so
+    # 'failed' no longer drops out of it — and must not, or the fresh pass
+    # would re-derive (1..12) and claim the same messages under a second key.
     assert pg.claimed[("s", 12)] == "failed"
-    assert pg.watermarks() == {}
+    assert pg.watermarks() == {"s": 12}
 
 
 def test_context_tail_feeds_the_continuation_transcript(hermes_db):
@@ -430,6 +470,12 @@ class RaisingPg:
 
     def pending_dispatch(self):
         return []
+
+    def failed_slices(self, **kw):
+        return []
+
+    def slice_status(self, **kw):
+        return None
 
     def record_run(self, **kw):
         raise AssertionError("record_run must not run under --dry-run")
@@ -559,14 +605,19 @@ def test_a_real_extraction_failure_marks_failed_and_the_slice_comes_back(hermes_
     assert result["extracted"] == 0 and result["entries"] == 0 and result["jobs"] == 0
     assert written == [] and jobs == []
     assert pg.claimed[("s", 12)] == "failed"
-    # 'failed' is excluded from the watermark, which is what re-offers the slice.
-    assert pg.watermarks() == {}
+    # The frontier counts it (ADR-0003 decision 2), so the FRESH pass sees
+    # nothing here — the retry pass below is what brings the slice back.
+    assert pg.watermarks() == {"s": 12}
     failed = [kw for kind, kw in pg.marks if kind == "failed"]
     assert "timed out" in str(failed[0]["error"])
 
     deps2, written2, jobs2 = make_deps(path, pg)
     result2 = sw.sweep(deps2, CFG)
-    assert result2["candidates"] == 1 and result2["extracted"] == 1
+    # `candidates` counts the fresh pass only, and it is 0 on purpose: this
+    # slice comes back as a RETRY at its own recorded range, under the same
+    # key, which is what keeps the job id identical to the first attempt's.
+    assert result2["candidates"] == 0 and result2["retried"] == 1
+    assert result2["extracted"] == 1
     assert jobs2 == [sw.job_id("s", 12, 0)]
 
 
@@ -584,15 +635,19 @@ def test_a_missing_api_key_does_not_consume_the_backlog(hermes_db):
         timeout=5, opener=raising_opener)
     sw.sweep(deps, CFG)
     assert pg.claimed[("s", 12)] == "failed"
-    assert pg.watermarks() == {}
+    assert pg.watermarks() == {"s": 12}          # the frontier counts it
 
 
 def test_a_stale_claim_is_expired_and_its_slice_extracted_again(hermes_db):
     """FIX 2. A hard crash between claim and extract leaves the row at
-    'claimed'; watermarks() counts it, find_candidates then sees zero pending
-    messages and skips the session, so claim() is never called with that key
-    and its reclaim branch can never fire. Reproduced before the fix as
-    `candidates: 0` forever."""
+    'claimed', and nothing offers a 'claimed' row again: watermarks() counts
+    it, so find_candidates sees zero pending messages and skips the session.
+    Reproduced before the fix as `candidates: 0` forever.
+
+    Since ADR-0003 the repair path is the retry pass rather than the fresh one
+    — expiring rewrites the row to 'failed', and a failed row is retried at its
+    own recorded range. `candidates` (the fresh pass) is 0 here for that
+    reason; `retried` is where the work shows up."""
     now = time.time()
     sessions, messages = rich_session(now)
     path = hermes_db(sessions=sessions, messages=messages)
@@ -603,7 +658,8 @@ def test_a_stale_claim_is_expired_and_its_slice_extracted_again(hermes_db):
 
     deps, written, jobs = make_deps(path, pg)
     result = sw.sweep(deps, CFG)
-    assert result["candidates"] == 1 and result["extracted"] == 1
+    assert result["candidates"] == 0 and result["retried"] == 1
+    assert result["extracted"] == 1
     assert pg.claimed[("s", 12)] == "published"
     assert jobs == [sw.job_id("s", 12, 0)]
 
@@ -839,8 +895,10 @@ def test_a_quarantined_slice_advances_the_watermark_and_later_messages_are_offer
     deps.extract = deterministic_boom
     sw.sweep(deps, CFG)
     assert pg.claimed[("s", 12)] == "quarantined"
-    # Only 'failed' is excluded from the watermark — the retired slice must
-    # not block the session's later messages behind it forever.
+    # A quarantined slice counts toward the watermark (under the frontier
+    # every status does) — the retired slice must not block the session's later
+    # messages behind it forever. It is also unreachable from the retry pass,
+    # which reads 'failed' rows only: that is why almost nothing may quarantine.
     assert pg.watermarks() == {"s": 12}
 
     con = sqlite3.connect(path)
@@ -1104,3 +1162,124 @@ def test_the_real_adapter_answers_everything_the_sweeper_asks_of_pg():
     used = {name for name in dir(FakePg) if not name.startswith("_")}
     missing = used - {n for n in dir(sw._PgAdapter) if not n.startswith("_")}
     assert not missing, f"_PgAdapter is missing {missing}; sweep() would fail open and do nothing"
+
+
+# ── ADR-0003: a failed row is retried at its own range ────────────────────
+
+def cfg(**overrides):
+    """CFG with this test's knobs changed. The retry pass is bounded by
+    `max_per_run` and by both circuit breakers, so those are what varies."""
+    return {**CFG, **overrides}
+
+
+def keys(marks):
+    """(mark, row key) for every mark FakePg recorded.
+
+    The payload-shaped kwargs are dropped on purpose: a test asserting WHICH
+    row reached WHICH state should not have to restate the jobs list, the score
+    and the entry count that happened to travel with it.
+    """
+    return [(kind, {"session_id": kw["session_id"], "last_message_id": kw["last_message_id"]})
+            for kind, kw in marks if "last_message_id" in kw]
+
+
+# The plan's name for the failure `transient_boom` already raises. Same
+# function, so the two names cannot drift into two different definitions of
+# "transient".
+raises_transient = transient_boom
+
+
+def raises_deterministic_for(*session_ids):
+    """An extract that fails deterministically for these sessions and succeeds
+    for every other one.
+
+    It identifies the session by reading the transcript, which is why
+    `build_deps_with` stamps the session id into every message body: `deps
+    .extract` is handed a transcript and nothing else, so there is no other
+    channel to tell it which conversation it is looking at.
+    """
+    def extract(transcript):
+        if any(f"session {sid}:" in transcript for sid in session_ids):
+            raise extraction.ExtractionFailed("bad model output", transient=False)
+        return [{"type": "decision", "summary": "s", "content": "c",
+                 "training_value": "high"}]
+    return extract
+
+
+@pytest.fixture
+def build_deps_with(hermes_db):
+    """Deps over a state.db built from message IDS rather than from a shape.
+
+    `messages=range(1, 21)` is one session "s" whose message ids are exactly
+    those; `sessions={"a": range(1, 11), ...}` is the same for several at once.
+    The ids matter here in a way they do not in the older fixtures, because
+    the whole question these tests ask is WHICH range gets read and under which
+    key it is claimed. Every session is two hours idle and substantive enough
+    to clear `quality_threshold`, since none of these tests is about the gates.
+
+    Ids must not repeat ACROSS sessions: conftest's `messages` table is
+    `id INTEGER PRIMARY KEY`, mirroring the real state.db, where ids are
+    globally unique rather than per-session.
+    """
+    def build(pg, *, messages=None, sessions=None, extract=None):
+        spec = sessions if sessions is not None else {
+            "s": messages if messages is not None else []}
+        now = time.time()
+        session_rows, message_rows = [], []
+        for sid, ids in spec.items():
+            ids = list(ids)
+            session_rows.append(SESSION(sid, last_activity_at=now - 2 * HOUR,
+                                        message_count=len(ids)))
+            for n, mid in enumerate(ids):
+                if n % 2 == 0:
+                    message_rows.append(MSG(mid, sid, "user", f"session {sid}: " + "u" * 60))
+                else:
+                    message_rows.append(
+                        MSG(mid, sid, "assistant",
+                            f"session {sid}: decided. Result: works. " + "d" * 200))
+        deps, _, _ = make_deps(hermes_db(sessions=session_rows, messages=message_rows), pg)
+        if extract is not None:
+            deps.extract = extract
+        return deps
+    return build
+
+
+def test_a_hole_under_a_published_slice_is_offered_at_its_own_range(build_deps_with):
+    """(S,1..10) failed, (S,11..20) published, nothing new. The old code offered
+    nothing at all — MAX(last_message_id) WHERE status<>'failed' was 20."""
+    pg = FakePg(claimed=[("s", 20)])
+    pg.claimed[("s", 10)] = "failed"
+    pg.ranges[("s", 10)] = (1, 10)
+    deps = build_deps_with(pg, messages=range(1, 21))
+    sw.sweep(deps, cfg())
+    assert ("published", {"session_id": "s", "last_message_id": 10}) in keys(pg.marks)
+
+
+def test_the_retry_pass_and_the_fresh_pass_never_claim_the_same_messages(build_deps_with):
+    """(S,1..10) failed with a tail grown to 25. The frontier is 10, so the
+    fresh pass starts at 11 — it must NOT build (1..25)."""
+    pg = FakePg()
+    pg.claimed[("s", 10)] = "failed"
+    pg.ranges[("s", 10)] = (1, 10)
+    deps = build_deps_with(pg, messages=range(1, 26))
+    sw.sweep(deps, cfg(max_per_run=5))
+    claimed_ranges = [c["kwargs"] for c in pg.calls if c["fn"] == "claim"]
+    assert sorted((c["first_message_id"], c["last_message_id"]) for c in claimed_ranges) \
+        == [(1, 10), (11, 25)]
+
+
+def test_two_poison_retry_rows_do_not_starve_an_unrelated_fresh_session(build_deps_with):
+    """Both breakers end the run with `break`. Interleaving is what guarantees
+    the fresh candidate is reached before the second retry can trip one.
+
+    The three sessions get disjoint id blocks (1.., 101.., 201..) because
+    conftest's `messages.id` is a global primary key, as the real one is."""
+    pg = FakePg()
+    for sid, last in (("a", 10), ("b", 110)):
+        pg.claimed[(sid, last)] = "failed"
+        pg.ranges[(sid, last)] = (last - 9, last)
+    deps = build_deps_with(pg, sessions={"a": range(1, 11), "b": range(101, 111),
+                                         "c": range(201, 211)},
+                           extract=raises_deterministic_for("a", "b"))
+    sw.sweep(deps, cfg(max_per_run=3, deterministic_sessions_abort=2))
+    assert ("published", {"session_id": "c", "last_message_id": 210}) in keys(pg.marks)

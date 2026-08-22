@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import functools
 import hashlib
+import itertools
 import logging
 import sys
 import time
@@ -151,13 +152,13 @@ def sweep(deps: Deps, cfg: dict) -> dict:
     now = deps.now()
     deps.pg.ensure_schema()
 
-    # BEFORE watermarks(), and the order is the whole fix. A hard crash leaves a
-    # row at 'claimed'; watermarks() counts it; find_candidates then sees zero
-    # pending messages for that session and skips it — so claim() is never
-    # called with that key and its stale-claim ON CONFLICT branch can never
-    # fire. Expiring here drops the row out of the watermark, which puts the
-    # slice back in front of find_candidates, and claim()'s existing 'failed'
-    # arm re-claims it. Measured before the fix: a stuck 'claimed' row at
+    # BEFORE failed_slices(), and the order is the whole fix. A hard crash
+    # leaves a row at 'claimed', and NOTHING offers a 'claimed' row again: the
+    # retry pass below reads 'failed' rows only, and the fresh pass cannot see
+    # it either because watermarks() counts it. Rewriting it to 'failed' here
+    # is what hands it to the retry pass — which takes it at its own recorded
+    # range once the backoff this expiry sets comes due, i.e. next cadence
+    # rather than this run. Measured before the fix: a stuck 'claimed' row at
     # (s, 12) with 12 unextracted messages reported `candidates: 0` forever.
     expired = deps.pg.expire_stale_claims()
     if expired:
@@ -174,20 +175,73 @@ def sweep(deps: Deps, cfg: dict) -> dict:
 
     stats = {"candidates": 0, "extracted": 0, "entries": 0, "jobs": 0,
              "quarantined": 0, "aborted": False, "locked_out": 0, "stale_slices": 0,
-             "last_error": None, "redispatched": redispatch(deps)}
+             "retried": 0, "last_error": None, "redispatched": redispatch(deps)}
     marks = deps.pg.watermarks()
     warned_compacted = False
 
+    # THE RETRY PASS (ADR-0003 decision 1). A failed row is retried at its own
+    # recorded range, not re-derived from the watermark: the watermark is now
+    # the frontier and counts failed rows too, so a hole under a published
+    # slice is unreachable from the fresh pass by construction — this is the
+    # only thing that offers it again.
+    #
+    # session_id_filter is read HERE rather than after find_candidates, where
+    # it used to be assigned: a retry block above that line raises
+    # UnboundLocalError on the first owed row. Moved, not duplicated.
+    session_id_filter = cfg.get("session_id")
+    retry_slices = []
+    # At most max_per_run - 1, so a run always has a fresh slot — EXCEPT at
+    # max_per_run == 1, where the single slot goes to the retry: with one slice
+    # per run neither breaker can trip (both need two), so there is nothing to
+    # starve, and an owed answer outranks new work.
+    retry_budget = cfg["max_per_run"] - 1 if cfg["max_per_run"] > 1 else 1
+    try:
+        owed = deps.pg.failed_slices()
+    except Exception as exc:                  # fail-open, same as every other round trip
+        logger.warning("failed_slices read failed: %s", exc)
+        owed = []
+    for row in owed[:retry_budget]:
+        if session_id_filter and row["session_id"] != session_id_filter:
+            continue
+        messages = hermes_state.read_slice_range(
+            deps.sqlite_conn, row["session_id"],
+            first_id=row["first_message_id"], last_id=row["last_message_id"])
+        if not messages:
+            # Every message in the range went inactive or was rewritten by
+            # compaction since the claim. Skipped rather than swept: with no
+            # messages the transcript is empty, the score is below any
+            # threshold, and the slice would close as 'published' — a hole
+            # retired silently as if it had been read. ADR-0003 decision 1
+            # retires it explicitly instead; that is the next commit.
+            continue
+        cand = hermes_state.Candidate(
+            row["session_id"], hermes_state.session_source(deps.sqlite_conn, row["session_id"]),
+            None, 0.0, len(messages))
+        # NO idle_seconds / min_messages GATE, deliberately. Those ask "has this
+        # conversation finished growing" — a question already answered when this
+        # range was claimed the first time. Applying them again would park a
+        # short hole in a still-active session forever.
+        retry_slices.append((cand, [], messages, row))
+
     with hermes_state.snapshot(deps.sqlite_conn):
+        # max_per_run bounds THE RUN, not each pass. The fresh pass gets only
+        # what the retries left, or a configured budget of three would cost
+        # five LLM calls — and max_per_run is not only money: its own comment
+        # below calls it "how many distinct sessions a single run can ever
+        # touch", which is what the cross-session breaker is calibrated
+        # against. The zero case is skipped rather than passed through:
+        # find_candidates' `if len(out) >= limit: break` sits AFTER the append,
+        # so limit=0 returns one candidate, which stats["candidates"] would
+        # then report for a slice the truncation below throws away.
+        fresh_budget = max(0, cfg["max_per_run"] - len(retry_slices))
         candidates = hermes_state.find_candidates(
             deps.sqlite_conn, now=now, idle_seconds=cfg["idle_seconds"],
             max_lag_seconds=cfg["max_lag_seconds"], watermarks=marks,
-            min_messages=cfg["min_messages"], limit=cfg["max_per_run"])
-        session_id_filter = cfg.get("session_id")
+            min_messages=cfg["min_messages"], limit=fresh_budget) if fresh_budget else []
         if session_id_filter:
             candidates = [c for c in candidates if c.session_id == session_id_filter]
         stats["candidates"] = len(candidates)
-        slices = []
+        fresh_slices = []
         for cand in candidates:
             after = marks.get(cand.session_id, 0)
             messages = hermes_state.read_slice(deps.sqlite_conn, cand.session_id,
@@ -208,7 +262,23 @@ def sweep(deps: Deps, cfg: dict) -> dict:
             context = hermes_state.context_tail(deps.sqlite_conn, cand.session_id,
                                                 before_id=after,
                                                 limit=cfg["context_overlap"]) if after else []
-            slices.append((cand, context, messages))
+            fresh_slices.append((cand, context, messages))
+
+    # itertools.zip_longest, not concatenation. Retry first at each position
+    # keeps "a session that owes an answer gives it before it takes on more
+    # work" true where it matters — within a session the frontier already makes
+    # the two ranges disjoint — while guaranteeing fresh work is reached. A
+    # strict retry-first ordering was revision 2 of ADR-0003 and it starves:
+    # both circuit breakers end a run with `break` over ONE list, so two
+    # failing retry rows in different sessions would abort the sweep before any
+    # fresh candidate was reached, every cadence, until an operator noticed.
+    slices = [x for pair in itertools.zip_longest(
+                  retry_slices,
+                  [(c, ctx, msgs, None) for c, ctx, msgs in fresh_slices])
+              for x in pair if x is not None]
+    # A belt on top of the two budgets above: neither pass can exceed its own,
+    # but only this makes the RUN's ceiling true regardless of how they split.
+    slices = slices[:cfg["max_per_run"]]
 
     # Run-local circuit breaker state (ADR-0002 decision 4). `transient_streak`
     # counts CONSECUTIVE transient failures — any non-transient outcome resets
@@ -227,8 +297,19 @@ def sweep(deps: Deps, cfg: dict) -> dict:
     det_sessions: set[str] = set()
     det_rows: list[tuple[str, int]] = []
 
-    for cand, context, messages in slices:
-        first_id, last_id = messages[0].id, messages[-1].id
+    for cand, context, messages, retry_row in slices:
+        if retry_row is not None:
+            # THE ROW'S OWN KEY, never the messages'. A message inside the
+            # range can have gone inactive since the claim, which makes
+            # messages[-1].id smaller than the row's last_message_id — and
+            # claiming under THAT key INSERTs a second row instead of
+            # reclaiming this one, leaving the original 'failed' forever while
+            # the new one re-extracts the same text. ADR-0003 decision 1: the
+            # claim key is the row's own, which is also what keeps job_id and
+            # point_id stable across retries so a replay upserts.
+            first_id, last_id = retry_row["first_message_id"], retry_row["last_message_id"]
+        else:
+            first_id, last_id = messages[0].id, messages[-1].id
 
         # ADR-0002 decision 3: pg_try_advisory_xact_lock, keyed on this
         # session, BEFORE claim(). One bad round trip must not stop the
@@ -244,36 +325,71 @@ def sweep(deps: Deps, cfg: dict) -> dict:
             stats["locked_out"] += 1
             continue
 
-        # THE RE-READ IS THE FIX, NOT THE LOCK. `marks` (used to build this
-        # slice) was read before ANY sweeper took this lock, so a concurrent
-        # sweeper could have read the same stale watermark, built a slice for
-        # the same messages, won the lock first, and already published —
-        # advancing the watermark past `first_id`. Its last_message_id and
-        # ours differ (different watermark at build time), so the UNIQUE
-        # constraint would never catch this: only re-reading after the lock
-        # can. `>=` because a moved watermark means this slice's earliest
-        # message has already been consumed by the other winner.
+        # A RETRY ASKS A DIFFERENT FRESHNESS QUESTION, and asking it the fresh
+        # pass's way silently disables the whole feature: with the frontier, a
+        # hole's first_id is 1 and the watermark is past it by construction, so
+        # `fresh_marks[...] >= first_id` is true for EVERY retry and every one
+        # would be skipped as stale. What a retry needs to know is whether its
+        # row still owes an answer — another sweeper holding the lock before us
+        # may have retried and published it. Same round trip, same fail-open
+        # handling, different key.
         #
-        # This round trip can fail exactly like its two neighbours above and
-        # below (fix round 1, Finding 1) — it used to sit bare, so a dropped
-        # connection here escaped sweep() entirely and ended the whole run,
-        # losing every remaining candidate instead of deferring just this
-        # one. Counted under `locked_out`: from the run's perspective this
-        # candidate was not safely processable past the lock step either way
-        # (contention or a bad connection), and a third counter for "held the
-        # lock but couldn't confirm freshness" would not tell an operator
-        # anything they would act on differently.
-        try:
-            fresh_marks = deps.pg.watermarks()
-        except Exception as exc:
-            logger.warning("watermark re-read for %s failed: %s", cand.session_id, exc)
-            stats["locked_out"] += 1
-            continue
-        if fresh_marks.get(cand.session_id, 0) >= first_id:
-            logger.info("slice %s:%s is stale — the watermark moved past it while "
-                       "waiting for the lock", cand.session_id, last_id)
-            stats["stale_slices"] += 1
-            continue
+        # slice_status, NOT a scan of failed_slices(): that list is windowed at
+        # 50 rows AND filtered by the backoff clock, so on a busy repair a
+        # genuinely-owed row falls outside it and gets logged as "resolved by
+        # another sweeper" when nobody resolved anything.
+        #
+        # This read is for the LOG LINE and the early skip. It is NOT the
+        # authority on due-ness and must not be: between failed_slices() and
+        # this lock, another sweeper can claim the row, fail it, and push
+        # next_retry_at hours out — leaving status back at 'failed', which this
+        # check would wave through, defeating the backoff. The authority is the
+        # claim SQL itself, which checks due-ness inside the UPDATE and is
+        # therefore atomic (ADR-0003 decision 3).
+        if retry_row is not None:
+            try:
+                still_owed = deps.pg.slice_status(
+                    session_id=cand.session_id, last_message_id=last_id) == "failed"
+            except Exception as exc:
+                logger.warning("failed-row re-read for %s failed: %s", cand.session_id, exc)
+                stats["locked_out"] += 1
+                continue
+            if not still_owed:
+                logger.info("slice %s:%s was resolved by another sweeper while we "
+                            "waited for the lock", cand.session_id, last_id)
+                stats["stale_slices"] += 1
+                continue
+        else:
+            # THE RE-READ IS THE FIX, NOT THE LOCK. `marks` (used to build this
+            # slice) was read before ANY sweeper took this lock, so a concurrent
+            # sweeper could have read the same stale watermark, built a slice for
+            # the same messages, won the lock first, and already published —
+            # advancing the watermark past `first_id`. Its last_message_id and
+            # ours differ (different watermark at build time), so the UNIQUE
+            # constraint would never catch this: only re-reading after the lock
+            # can. `>=` because a moved watermark means this slice's earliest
+            # message has already been consumed by the other winner.
+            #
+            # This round trip can fail exactly like its two neighbours above and
+            # below (fix round 1, Finding 1) — it used to sit bare, so a dropped
+            # connection here escaped sweep() entirely and ended the whole run,
+            # losing every remaining candidate instead of deferring just this
+            # one. Counted under `locked_out`: from the run's perspective this
+            # candidate was not safely processable past the lock step either way
+            # (contention or a bad connection), and a third counter for "held the
+            # lock but couldn't confirm freshness" would not tell an operator
+            # anything they would act on differently.
+            try:
+                fresh_marks = deps.pg.watermarks()
+            except Exception as exc:
+                logger.warning("watermark re-read for %s failed: %s", cand.session_id, exc)
+                stats["locked_out"] += 1
+                continue
+            if fresh_marks.get(cand.session_id, 0) >= first_id:
+                logger.info("slice %s:%s is stale — the watermark moved past it while "
+                            "waiting for the lock", cand.session_id, last_id)
+                stats["stale_slices"] += 1
+                continue
 
         # claim() is a Postgres round trip like any other and can raise (a
         # dropped connection, a lock timeout). One bad slice must not stop the
@@ -290,14 +406,21 @@ def sweep(deps: Deps, cfg: dict) -> dict:
             logger.warning("claim for slice %s:%s failed: %s", cand.session_id, last_id, exc)
             continue
         if not won:
+            # For a retry this is also how the backoff race ends: the claim SQL
+            # re-checks due-ness inside the UPDATE, so a row another sweeper
+            # deferred between failed_slices() and here simply loses the claim
+            # rather than being taken anyway (ADR-0003 decision 3).
             logger.info("slice %s:%s already claimed", cand.session_id, last_id)
             continue
+        if retry_row is not None:
+            stats["retried"] += 1
 
         # Extraction phase: anything that goes wrong here leaves the row at
-        # 'claimed', which watermarks() counts the same as any other non-failed
-        # status — so a silent failure here would mean the slice is never
-        # offered again. It must be marked FAILED instead, which both excludes
-        # it from the watermark and makes it reclaimable by claim().
+        # 'claimed', which watermarks() counts the same as every other status —
+        # so a silent failure here would mean the slice is never offered again.
+        # It must be marked FAILED instead, which is what puts it in front of
+        # the retry pass (ADR-0003 decision 1); before that ADR the mechanism
+        # was the watermark excluding 'failed' rows, and it no longer does.
         try:
             exchanges = extraction.messages_to_exchanges(messages)
             score = extraction.score_exchanges(exchanges)
@@ -566,7 +689,7 @@ def _dry_run_stubs(deps: Deps, pg: _PgAdapter) -> None:
     'published' while enqueue_stub sends nothing — permanently losing slices a
     real run left mid-flight. So every write — including schema DDL and the
     end-of-run status row — goes through a stub; only reads (watermarks,
-    pending_dispatch) stay real."""
+    pending_dispatch, failed_slices, slice_status) stay real."""
     pg.ensure_schema = lambda: logger.info("[dry-run] would ensure_schema")
     # An UPDATE like any other: a dry run must not flip a live 'claimed' row to
     # 'failed' behind an operator who is only looking.
@@ -708,7 +831,7 @@ def main(argv=None) -> dict:
                 entries=r.get("entries", 0), jobs=r.get("jobs", 0),
                 redispatched=r.get("redispatched", 0), quarantined=r.get("quarantined", 0),
                 aborted=r.get("aborted", False), locked_out=r.get("locked_out", 0),
-                stale_slices=r.get("stale_slices", 0),
+                stale_slices=r.get("stale_slices", 0), retried=r.get("retried", 0),
                 schema_version=hermes_state.schema_version(sqlite_conn),
                 error=error or r.get("last_error"))
         except Exception:

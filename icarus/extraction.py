@@ -33,8 +33,10 @@ class ExtractionFailed(RuntimeError):
 
     So `[]` is now returned ONLY when the model genuinely produced an empty
     list, and everything else raises. The sweeper's `mark_failed` path turns
-    that into a `failed` row, which `watermarks()` excludes, so the slice is
-    offered again on the next sweep.
+    that into a `failed` row, which the sweeper's RETRY pass offers again at
+    the row's own recorded range once its backoff is due (ADR-0003 decision 1).
+    `watermarks()` excluding 'failed' used to be what re-offered it; since
+    ADR-0003 the watermark is the frontier and excludes nothing.
 
     `transient` decides whether this failure counts against the ceiling
     (ADR-0002 decision 4). A LiteLLM outage spanning three sweeps must not

@@ -180,6 +180,16 @@ SCHEMA = (
     ALTER TABLE sweeper_status
         ADD COLUMN IF NOT EXISTS stale_slices INTEGER NOT NULL DEFAULT 0
     """,
+    # How many of this run's slices came from the RETRY pass (ADR-0003
+    # decision 1). Not a duplicate of `extracted`: a hole can close having
+    # produced zero entries — a range that extracts cleanly but yields nothing
+    # resolves as 'published' and is gone from the retry pass forever — so an
+    # operator reading entry counts alone would see a repair as nothing
+    # happening at all.
+    """
+    ALTER TABLE sweeper_status
+        ADD COLUMN IF NOT EXISTS retried INTEGER NOT NULL DEFAULT 0
+    """,
 )
 
 
@@ -191,11 +201,24 @@ def ensure_schema(conn) -> None:
 
 
 def watermarks(conn) -> dict[str, int]:
-    """How far each session has been consumed. 'failed' rows do not count, so a
-    failed slice is offered again on the next sweep."""
+    """How far each session has been consumed. ALL statuses count, 'failed'
+    included, and that inclusion is load-bearing rather than a simplification.
+
+    Excluding 'failed' was how a failed slice got offered again: it dropped out
+    of MAX, so the next sweep re-derived a slice from below it. ADR-0003 ended
+    that — a failed row is retried at its own range by the retry pass — and
+    with the exclusion still in place BOTH passes would target the same
+    messages. Concretely: (s,1..10) failed with the conversation grown to 25
+    gives the fresh pass `after = 0`, so it builds (s,1..25), a DIFFERENT key
+    from (s,10), which means UNIQUE (session_id, last_message_id) cannot catch
+    the overlap and the same ten messages are extracted twice.
+
+    The frontier makes the fresh pass start at 11 and leaves 1..10 to the retry
+    pass. Nothing is stranded, because the retry pass is now what re-offers it.
+    """
     with conn.cursor() as cur:
         cur.execute("""SELECT session_id, MAX(last_message_id) FROM session_extraction
-                       WHERE status <> 'failed' GROUP BY session_id""")
+                       GROUP BY session_id""")
         return {row[0]: int(row[1]) for row in cur.fetchall()}
 
 
@@ -247,7 +270,16 @@ _CLAIM_RECLAIM_SQL = f"""
     VALUES (%s, %s, %s, %s)
     ON CONFLICT (session_id, last_message_id) DO UPDATE
         SET status = 'claimed', claimed_at = now(), updated_at = now()
-        WHERE session_extraction.status = 'failed'
+        WHERE (session_extraction.status = 'failed'
+               -- Due-ness belongs HERE and not only in failed_slices(): that
+               -- read happens before the lock, and another sweeper can fail
+               -- the row and push its backoff out in between. Checked in the
+               -- UPDATE, the row either is still due when we take it or we do
+               -- not take it (ADR-0003 decision 3).
+               AND (session_extraction.next_retry_at IS NULL
+                    OR session_extraction.next_retry_at <= now()))
+           -- The stale-'claimed' arm keeps no such condition, deliberately: a
+           -- 'claimed' row has no backoff to respect.
            OR (session_extraction.status = 'claimed'
                AND session_extraction.updated_at
                    < now() - make_interval(hours => %s))
@@ -282,18 +314,21 @@ _EXPIRE_STALE_SQL = """
 def expire_stale_claims(conn, *, stale_hours=STALE_CLAIM_HOURS) -> int:
     """Turn abandoned 'claimed' rows into 'failed' ones. Returns how many.
 
-    THIS MUST RUN BEFORE `watermarks()` IS READ, and the reason is that
-    `claim()`'s own stale-claimed branch could never fire for the case it was
-    written for. A hard crash leaves a row at 'claimed'; `watermarks()` counts
-    it; `find_candidates` then sees zero pending messages for that session and
-    skips it — so `claim()` is never called with that key, the ON CONFLICT
-    never happens, and the reclaim arm is unreachable. Measured: a stuck
-    'claimed' row at (s, 12) with 12 unextracted messages yields
+    THIS MUST RUN BEFORE `failed_slices()` IS READ. A hard crash leaves a row
+    at 'claimed', and NOTHING offers a 'claimed' row again: the retry pass reads
+    'failed' rows only, and the fresh pass cannot reach it either, because the
+    watermark counts it (it counted it before ADR-0003 too, and since ADR-0003
+    the frontier counts every status). Measured before this existed: a stuck
+    'claimed' row at (s, 12) with 12 unextracted messages yielded
     `candidates: 0` forever.
 
-    Expiring the row here instead drops it out of the watermark, which puts the
-    slice back in front of `find_candidates`, and the existing 'failed' arm of
-    `claim()` then re-claims it. No new state, no new path.
+    Rewriting it to 'failed' here is what hands it to the retry pass, which
+    re-offers it at its own recorded range once the backoff this statement sets
+    comes due — one cadence later, not this sweep. Until ADR-0003 the mechanism
+    was different: 'failed' dropped the row out of the watermark, which put the
+    slice back in front of `find_candidates` and let `claim()`'s 'failed' arm
+    reclaim it. The frontier ended that route; the row is now reached by key,
+    not by re-derivation.
     """
     with conn.cursor() as cur:
         cur.execute(_EXPIRE_STALE_SQL, (stale_hours,))
@@ -312,15 +347,24 @@ def claim(conn, *, session_id, first_message_id, last_message_id, message_count,
     per crash, silently, forever. So a fresh `INSERT ... DO NOTHING` is tried
     first (the common case: a brand-new slice, or one somebody else legitimately
     owns), and only on conflict does a second statement attempt the reclaim: a
-    claim already marked 'failed', or one older than `stale_hours`, is
+    claim already marked 'failed' AND DUE, or one older than `stale_hours`, is
     re-claimable; a fresh 'claimed' row is not.
 
-    Which arm actually fires: the 'failed' one. `expire_stale_claims()` runs at
-    the top of every sweep and has already rewritten abandoned 'claimed' rows to
-    'failed' by the time a candidate reaches here — it has to, because a row
-    left at 'claimed' never becomes a candidate at all (see that function). The
-    stale-'claimed' arm is kept as belt-and-braces for a row that goes stale
-    between the expiry and this statement, i.e. a second sweeper mid-flight.
+    Which arm actually fires: the 'failed' one, and since ADR-0003 it is what
+    every retry goes through — the retry pass claims the failed row under its
+    OWN key rather than deriving a new one, so this is no longer an edge case
+    but the main path. `expire_stale_claims()` runs at the top of every sweep
+    and has already rewritten abandoned 'claimed' rows to 'failed' by the time
+    a candidate reaches here — it has to, because nothing offers a row left at
+    'claimed' (see that function). The stale-'claimed' arm is kept as
+    belt-and-braces for a row that goes stale between the expiry and this
+    statement, i.e. a second sweeper mid-flight.
+
+    A 'failed' row that is not DUE loses the claim, and that is the point of
+    putting the backoff clock in the SQL: `failed_slices()` reads before the
+    session lock is taken, so another sweeper can claim, fail and defer the row
+    in between, leaving `status` back at 'failed' — which a status-only re-read
+    waves straight through, defeating the backoff (ADR-0003 decision 3).
 
     This runs on every call — with no `stale_hours` given it falls back to
     `STALE_CLAIM_HOURS` — so the production call site does not have to remember
@@ -433,12 +477,25 @@ def mark_quarantined(conn, *, session_id, last_message_id, error) -> None:
     """Retire a slice that hit the deterministic-failure ceiling.
 
     Only status and error change — the payload column is left as-is (there
-    normally is none, since extraction never once succeeded for this slice).
-    `watermarks()` excludes only 'failed', so a quarantined slice still counts
-    toward the watermark and the session's later messages are not blocked
-    behind one that will never parse (ADR-0002 decision 4). The one-statement
-    operator replay is `UPDATE session_extraction SET status='failed',
-    attempts=0 WHERE ...`.
+    normally is none, since extraction never once succeeded for this slice). A
+    quarantined slice counts toward the watermark, so the session's later
+    messages are not blocked behind one that will never parse (ADR-0002
+    decision 4) — under the frontier every status counts, so this needs no
+    exception written for it.
+
+    THAT IS ALSO WHY QUARANTINE IS ALMOST NEVER THE RIGHT ANSWER. The retry
+    pass reads 'failed' rows only, so a quarantined row is unreachable from
+    BOTH passes: retiring one over an outage is permanent, silent loss of the
+    conversation. Exactly two things may reach here — the deterministic ceiling
+    (the model's own output does not parse and will not next time) and an
+    emptied range (the messages are gone from state.db, so there is no work
+    left to lose). A transient, unclassified or stale-claim failure must never
+    (ADR-0003 decision 3).
+
+    The one-statement operator replay is `UPDATE session_extraction SET
+    status='failed', attempts=0, next_retry_at=NULL WHERE ...`. The
+    `next_retry_at=NULL` is not decoration: without it the replayed row waits
+    out whatever leftover backoff it carried, up to 24 hours.
     """
     _update(conn, session_id, last_message_id, "status = 'quarantined', error = %s",
             (str(error)[:2000],))
@@ -557,7 +614,7 @@ def slice_status(conn, session_id: str, last_message_id: int) -> str | None:
 
 def record_run(conn, *, candidates, extracted, entries, jobs, schema_version, error,
                redispatched=0, quarantined=0, aborted=False, locked_out=0,
-               stale_slices=0) -> None:
+               stale_slices=0, retried=0) -> None:
     """One row per run, success or failure — "stalled" has to be a query.
 
     `redispatched` is here because a backlog that never drains is exactly the
@@ -587,7 +644,12 @@ def record_run(conn, *, candidates, extracted, entries, jobs, schema_version, er
     and watermark re-read failed while holding the lock) — see the ALTER's
     comment in SCHEMA and the sweeper's own note at that re-read.
 
-    All five keyword arguments default, and that is load-bearing rather than
+    `retried` is how many slices came from the retry pass (ADR-0003 decision
+    1), and it is here because a repair can be invisible in every other column:
+    a range that extracts cleanly but yields no entries closes the hole as
+    'published' with `extracted` counting it and nothing saying it was a hole.
+
+    All six keyword arguments default, and that is load-bearing rather than
     tidy: `record_run` has callers that predate each of them (including the
     fake-backed unit tests), and a required parameter here would turn a
     bookkeeping addition into a break at the one call site whose whole job is
@@ -597,10 +659,10 @@ def record_run(conn, *, candidates, extracted, entries, jobs, schema_version, er
         cur.execute(
             """INSERT INTO sweeper_status
                    (candidates, extracted, entries, jobs, redispatched,
-                    quarantined, aborted, locked_out, stale_slices,
+                    quarantined, aborted, locked_out, stale_slices, retried,
                     schema_version, error)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (candidates, extracted, entries, jobs, redispatched, quarantined,
-             bool(aborted), locked_out, stale_slices,
+             bool(aborted), locked_out, stale_slices, retried,
              schema_version, str(error)[:2000] if error else None))
     conn.commit()

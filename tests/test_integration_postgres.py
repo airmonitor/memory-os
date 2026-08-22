@@ -79,6 +79,21 @@ def test_a_second_claim_on_a_fresh_row_loses(conn):
                                last_message_id=9, message_count=4) is False
 
 
+def _make_due(conn, session_id, last_message_id):
+    """Bring a failed row's backoff clock forward so that it is due now.
+
+    `mark_failed` and `_EXPIRE_STALE_SQL` both schedule the next retry at least
+    15 minutes out, and since ADR-0003 decision 3 BOTH readers honour it —
+    `failed_slices()` and the 'failed' arm of `claim()`. A test that wants to
+    observe the reclaim rather than the backoff has to say so explicitly.
+    """
+    with conn.cursor() as cur:
+        cur.execute("UPDATE session_extraction SET next_retry_at = now() - interval '1 minute' "
+                    "WHERE session_id = %s AND last_message_id = %s",
+                    (session_id, last_message_id))
+    conn.commit()
+
+
 def test_a_stale_claim_is_reclaimable(conn):
     from scripts import session_store
     sid = f"s-{uuid.uuid4()}"
@@ -89,6 +104,12 @@ def test_a_stale_claim_is_reclaimable(conn):
                     "WHERE session_id = %s", (sid,))
     conn.commit()
     assert session_store.expire_stale_claims(conn, stale_hours=2) == 1
+    # The expiry set the backoff clock as well (15 minutes out — this row's
+    # first failure), and claim()'s 'failed' arm honours it, so an IMMEDIATE
+    # reclaim must lose. In production this row comes back a cadence later.
+    assert session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
+                               message_count=4) is False
+    _make_due(conn, sid, 9)
     assert session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
                                message_count=4) is True
     # A crash between claim and extraction is transient by nature - OOM, eviction,
@@ -120,6 +141,8 @@ def test_a_stale_claim_with_a_prior_failure_keeps_its_attempts_count(conn):
                                      error="bad json", count_attempt=True) == (1, 1)
     # Reclaim the now-'failed' row via claim()'s 'failed' reclaim arm, so the
     # row goes back to 'claimed' with attempts == 1 before it goes stale below.
+    # Due first: that arm honours the backoff clock mark_failed just set.
+    _make_due(conn, sid, 9)
     assert session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
                                message_count=4) is True
     with conn.cursor() as cur:
@@ -130,6 +153,7 @@ def test_a_stale_claim_with_a_prior_failure_keeps_its_attempts_count(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT attempts FROM session_extraction WHERE session_id = %s", (sid,))
         assert cur.fetchone()[0] == 1  # expire_stale_claims must not touch it
+    _make_due(conn, sid, 9)
     assert session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
                                message_count=4) is True
     with conn.cursor() as cur:
@@ -167,7 +191,7 @@ def test_ensure_schema_is_idempotent_against_a_live_server(conn):
                     "WHERE table_name = 'sweeper_status' AND table_schema = current_schema()")
         cols = {r[0] for r in cur.fetchall()}
     assert {"redispatched", "quarantined", "aborted", "locked_out",
-            "stale_slices"} <= cols
+            "stale_slices", "retried"} <= cols
 
 
 def test_ensure_schema_upgrades_an_existing_table_missing_the_new_columns(conn):
@@ -228,7 +252,7 @@ def test_ensure_schema_upgrades_an_existing_table_missing_the_new_columns(conn):
     # whose sweeper_status predates them upgrades or the run-level breakers
     # keep leaving no durable trace at all.
     assert {"redispatched", "quarantined", "aborted", "locked_out",
-            "stale_slices"} <= ss_cols
+            "stale_slices", "retried"} <= ss_cols
 
 
 def test_record_run_stores_the_circuit_breaker_outcome(conn):
@@ -458,3 +482,25 @@ def test_a_row_that_predates_the_column_is_due_immediately(conn):
 def test_slice_status_is_none_for_a_row_that_does_not_exist(conn):
     from scripts import session_store
     assert session_store.slice_status(conn, "nobody", 1) is None
+
+
+def test_a_row_rescheduled_between_selection_and_claim_is_not_reclaimed(conn):
+    """The window ADR-0003 decision 3 puts the due-ness test inside the UPDATE
+    for: `failed_slices()` reads BEFORE the session lock is taken, so another
+    sweeper can claim the row, fail it and push its backoff hours out in
+    between — leaving `status` back at 'failed', which a status-only re-read
+    waves straight through. Checked in the claim, the row is either still due
+    when it is taken or it is not taken."""
+    from scripts import session_store
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    session_store.mark_failed(conn, session_id="s", last_message_id=10, error="x")
+    _make_due(conn, "s", 10)
+    owed = session_store.failed_slices(conn)            # selected while due
+    assert owed
+    session_store.claim(conn, session_id="s", first_message_id=1,       # another sweeper
+                        last_message_id=10, message_count=10)
+    session_store.mark_failed(conn, session_id="s", last_message_id=10, error="x")
+    assert session_store.slice_status(conn, "s", 10) == "failed"        # status says go
+    assert session_store.claim(conn, session_id="s", first_message_id=1,
+                               last_message_id=10, message_count=10) is False
