@@ -15,6 +15,7 @@ import hashlib
 import logging
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -44,6 +45,21 @@ class Deps:
 
 def job_id(session_id: str, last_message_id: int, index: int) -> str:
     return f"ingest:{session_id}:{last_message_id}:{index}"
+
+
+_POINT_NS = uuid.NAMESPACE_URL
+
+
+def point_id(job: str) -> str:
+    """Stable id for a slice's entry, so a replay upserts rather than adds.
+
+    uuid4 stays the DEFAULT in the worker (see ingest_memory): content
+    addressing would collapse two ingestions of identical text under Qdrant's
+    upsert-by-id and erase the payload of the first. Only this caller knows
+    the identity it wants — the ARQ job id already assigned to this slice's
+    entry — so only this caller passes an explicit id (ADR-0002 decision 2).
+    """
+    return str(uuid.uuid5(_POINT_NS, job))
 
 
 def entry_suffix(session_id: str, last_message_id: int, index: int) -> str:
@@ -115,8 +131,9 @@ def redispatch(deps: Deps) -> int:
             for item in row["payload"]:
                 write_payload_entry(deps, item)
             for item in row["payload"]:
+                job = item.get("job_id")
                 deps.enqueue("process_ingestion", item["text"], "session",
-                             job_id=item["job_id"])
+                             job_id=item["job_id"], point_id=point_id(job) if job else None)
                 job_ids.append(item["job_id"])
             deps.pg.mark_published(session_id=row["session_id"],
                                    last_message_id=row["last_message_id"], jobs=job_ids)
@@ -255,8 +272,9 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                 stats["entries"] += 1
             job_ids = []
             for item in payload:
+                job = item.get("job_id")
                 deps.enqueue("process_ingestion", item["text"], "session",
-                             job_id=item["job_id"])
+                             job_id=item["job_id"], point_id=point_id(job) if job else None)
                 job_ids.append(item["job_id"])
                 stats["jobs"] += 1
             deps.pg.mark_published(session_id=cand.session_id, last_message_id=last_id,
@@ -338,9 +356,10 @@ class _Enqueuer:
         self._loop = asyncio.new_event_loop()
         self._pool = self._loop.run_until_complete(create_pool(redis_settings))
 
-    def __call__(self, job, *args, job_id):
+    def __call__(self, job, *args, job_id, point_id=None):
+        kwargs = {"point_id": point_id} if point_id is not None else {}
         return self._loop.run_until_complete(
-            self._pool.enqueue_job(job, *args, _job_id=job_id))
+            self._pool.enqueue_job(job, *args, _job_id=job_id, **kwargs))
 
     def close(self):
         self._loop.run_until_complete(self._pool.aclose())
@@ -379,7 +398,7 @@ def _dry_run_stubs(deps: Deps, pg: _PgAdapter) -> None:
         logger.info("[dry-run] would write fabric entry suffix=%s", kw.get("suffix"))
         return ""
 
-    def enqueue_stub(job, *args, job_id):
+    def enqueue_stub(job, *args, job_id, point_id=None):
         logger.info("[dry-run] would enqueue %s job_id=%s", job, job_id)
         return job_id
 

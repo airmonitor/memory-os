@@ -67,9 +67,18 @@ async def shutdown(ctx):
 
 
 # ─── ARQ function definitions ────────────────────────────────────────────
-async def process_ingestion(ctx, memory_text: str, source: str, tags: list = None):
-    """ARQ job: ingest a memory into the vector store."""
-    return await ingest_memory(ctx["qdrant"], memory_text, source, tags)
+async def process_ingestion(ctx, memory_text: str, source: str, tags: list = None,
+                            point_id: str = None):
+    """ARQ job: ingest a memory into the vector store.
+
+    `point_id` is optional so a job enqueued by an older producer — one that
+    never set this kwarg — still runs: it falls through as None and
+    `ingest_memory` picks a fresh uuid4, same as before this parameter existed.
+    Only the session sweeper passes it, to make a replayed dispatch upsert
+    its point instead of adding a second one; legacy points already in Qdrant
+    are not migrated by this.
+    """
+    return await ingest_memory(ctx["qdrant"], memory_text, source, tags, point_id=point_id)
 
 
 async def process_wiki_file(ctx, file_path: str):

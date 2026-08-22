@@ -31,6 +31,7 @@ async def ingest_memory(
     memory_text: str,
     source: str,
     tags: list | None = None,
+    point_id: str | None = None,
 ) -> dict:
     """
     Ingests an episodic memory into Qdrant.
@@ -40,7 +41,18 @@ async def ingest_memory(
         raise ValueError("memory_text cannot be empty")
 
     tags = tags or []
-    point_id = str(uuid.uuid4())
+    # uuid4 stays the DEFAULT here. A CONTENT hash was tried and rejected
+    # (ADR-0002 decision 2): Qdrant's upsert replaces the payload at an
+    # existing id, so two ingestions of identical text with different
+    # source/tags/lifecycle fields would collapse last-writer-wins and erase
+    # the first one's attribution. `ingest_memory` has exactly one caller
+    # (`process_ingestion` below) — the wiki path uses `ingest_file` and the
+    # reflection path builds its own `PointStruct` — and only the session
+    # sweeper passes `point_id` explicitly, derived from its own job id, so a
+    # replayed dispatch upserts its point instead of adding a second one.
+    # Legacy points already in Qdrant were ingested before this parameter
+    # existed and are NOT migrated by it.
+    point_id = point_id or str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
 
     # Generate embedding

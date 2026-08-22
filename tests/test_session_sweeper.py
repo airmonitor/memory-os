@@ -89,7 +89,7 @@ def make_deps(path, pg, *, entries=None, enqueue=None):
         written.append(kw)
         return f"/fabric/{kw['suffix']}.md"
 
-    def _enqueue(job, *args, job_id):
+    def _enqueue(job, *args, job_id, point_id=None):
         jobs.append(job_id)
         return job_id
     return sw.Deps(sqlite_conn=hs.connect_ro(path), pg=pg,
@@ -108,6 +108,41 @@ def test_a_quiet_substantive_session_is_extracted_published_and_dispatched(herme
     assert result["extracted"] == 1 and result["entries"] == 1 and result["jobs"] == 1
     assert written[0]["suffix"] == sw.entry_suffix("s", 12, 0)
     assert jobs == [sw.job_id("s", 12, 0)]
+
+
+def test_every_dispatched_job_carries_its_deterministic_point_id(hermes_db):
+    now = time.time()
+    sessions, messages = rich_session(now)
+    captured = []
+
+    def enqueue(job, *args, job_id, **kw):
+        captured.append((job_id, kw.get("point_id")))
+        return job_id
+
+    deps, _, _ = make_deps(hermes_db(sessions=sessions, messages=messages), FakePg(),
+                           enqueue=enqueue)
+    sw.sweep(deps, CFG)
+    assert captured == [(sw.job_id("s", 12, 0), sw.point_id(sw.job_id("s", 12, 0)))]
+
+
+def test_redispatch_also_carries_the_deterministic_point_id(hermes_db):
+    """Controller decision: redispatch() must derive the same id from the
+    stored payload's job_id, with no new payload field — verified, not assumed."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    pg = FakePg()
+    pg.claimed[("old", 5)] = "extracted"
+    pg.payloads[("old", 5)] = [{"job_id": "ingest:old:5:0", "text": "stale"}]
+    captured = []
+
+    def enqueue(job, *args, job_id, **kw):
+        captured.append((job_id, kw.get("point_id")))
+        return job_id
+
+    deps, _, _ = make_deps(hermes_db(sessions=sessions, messages=messages), pg,
+                           enqueue=enqueue)
+    sw.sweep(deps, CFG)
+    assert ("ingest:old:5:0", sw.point_id("ingest:old:5:0")) in captured
 
 
 def test_a_lost_claim_skips_the_llm_call_entirely(hermes_db):
@@ -143,7 +178,7 @@ def test_a_slice_that_failed_to_dispatch_goes_out_on_the_next_sweep(hermes_db):
     path = hermes_db(sessions=sessions, messages=messages)
     pg = FakePg()
 
-    def boom(job, *args, job_id):
+    def boom(job, *args, job_id, point_id=None):
         raise RuntimeError("valkey down")
 
     deps, _, _ = make_deps(path, pg, enqueue=boom)
@@ -152,7 +187,7 @@ def test_a_slice_that_failed_to_dispatch_goes_out_on_the_next_sweep(hermes_db):
 
     sent = []
 
-    def ok(job, *args, job_id):
+    def ok(job, *args, job_id, point_id=None):
         sent.append(job_id)
         return job_id
 
@@ -170,7 +205,7 @@ def test_dispatch_failure_leaves_the_slice_re_runnable(hermes_db):
     now = time.time()
     sessions, messages = rich_session(now)
 
-    def boom(job, *args, job_id):
+    def boom(job, *args, job_id, point_id=None):
         raise RuntimeError("valkey down")
     pg = FakePg()
     deps, written, _ = make_deps(hermes_db(sessions=sessions, messages=messages), pg,
