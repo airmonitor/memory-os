@@ -171,7 +171,7 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                        live_schema, hermes_state.KNOWN_SCHEMA_VERSION)
 
     stats = {"candidates": 0, "extracted": 0, "entries": 0, "jobs": 0,
-             "quarantined": 0, "aborted": False,
+             "quarantined": 0, "aborted": False, "locked_out": 0, "stale_slices": 0,
              "redispatched": redispatch(deps)}
     marks = deps.pg.watermarks()
     warned_compacted = False
@@ -223,6 +223,37 @@ def sweep(deps: Deps, cfg: dict) -> dict:
 
     for cand, context, messages in slices:
         first_id, last_id = messages[0].id, messages[-1].id
+
+        # ADR-0002 decision 3: pg_try_advisory_xact_lock, keyed on this
+        # session, BEFORE claim(). One bad round trip must not stop the
+        # sweep — fail open, same as claim() below.
+        try:
+            locked = deps.pg.try_session_lock(session_id=cand.session_id)
+        except Exception as exc:
+            logger.warning("session lock for %s failed: %s", cand.session_id, exc)
+            continue
+        if not locked:
+            logger.info("session %s is being swept by another process — skipping",
+                       cand.session_id)
+            stats["locked_out"] += 1
+            continue
+
+        # THE RE-READ IS THE FIX, NOT THE LOCK. `marks` (used to build this
+        # slice) was read before ANY sweeper took this lock, so a concurrent
+        # sweeper could have read the same stale watermark, built a slice for
+        # the same messages, won the lock first, and already published —
+        # advancing the watermark past `first_id`. Its last_message_id and
+        # ours differ (different watermark at build time), so the UNIQUE
+        # constraint would never catch this: only re-reading after the lock
+        # can. `>=` because a moved watermark means this slice's earliest
+        # message has already been consumed by the other winner.
+        fresh_marks = deps.pg.watermarks()
+        if fresh_marks.get(cand.session_id, 0) >= first_id:
+            logger.info("slice %s:%s is stale — the watermark moved past it while "
+                       "waiting for the lock", cand.session_id, last_id)
+            stats["stale_slices"] += 1
+            continue
+
         # claim() is a Postgres round trip like any other and can raise (a
         # dropped connection, a lock timeout). One bad slice must not stop the
         # sweep, so a raise here is logged and this slice is skipped — it will
@@ -398,6 +429,9 @@ class _PgAdapter:
     def expire_stale_claims(self):
         return session_store.expire_stale_claims(self.conn)
 
+    def try_session_lock(self, session_id):
+        return session_store.try_session_lock(self.conn, session_id)
+
     def claim(self, **kw):
         return session_store.claim(self.conn, **kw)
 
@@ -457,6 +491,9 @@ def _dry_run_stubs(deps: Deps, pg: _PgAdapter) -> None:
     # An UPDATE like any other: a dry run must not flip a live 'claimed' row to
     # 'failed' behind an operator who is only looking.
     pg.expire_stale_claims = lambda: logger.info("[dry-run] would expire stale claims") or 0
+    # A dry run must take no lock either — pg_try_advisory_xact_lock is still a
+    # real round trip to a real database, and --dry-run promises neither.
+    pg.try_session_lock = lambda **kw: True
     pg.claim = lambda **kw: True
     pg.mark_extracted = lambda **kw: logger.info(
         "[dry-run] would mark_extracted %s:%s", kw.get("session_id"), kw.get("last_message_id"))

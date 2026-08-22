@@ -109,6 +109,40 @@ def watermarks(conn) -> dict[str, int]:
         return {row[0]: int(row[1]) for row in cur.fetchall()}
 
 
+_TRY_SESSION_LOCK_SQL = "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))"
+
+
+def try_session_lock(conn, session_id: str) -> bool:
+    """Win the exclusive right to sweep THIS session for the rest of the
+    caller's transaction (ADR-0002 decision 3).
+
+    `pg_try_advisory_xact_lock`, not the session-scoped `pg_try_advisory_lock`:
+    the xact-scoped variant is released on commit or rollback of the CALLER's
+    transaction — including the rollback a crashed process gets for free. A
+    session-scoped lock held by a hung process would block every later sweep
+    of that session until its connection dies: an unbounded stall traded for a
+    rare double-extraction. Which means THIS FUNCTION MUST NEVER COMMIT — a
+    commit here would release the lock immediately, before `claim()` ever runs
+    in the same transaction as this call.
+
+    Keyed on the session id via `hashtextextended`, bound as a parameter (never
+    interpolated) — not a single fixed key, which would serialise unrelated
+    sessions and targeted repair runs that touch entirely different rows.
+
+    THE LOCK ALONE PROTECTS NOTHING. Two sweeps that both read `watermarks()`
+    before either takes this lock compute DIFFERENT slice boundaries for the
+    same underlying messages, so their claims land on different
+    `(session_id, last_message_id)` keys — the UNIQUE constraint never fires,
+    and both win. The caller MUST re-read this session's watermark after
+    winning the lock and drop the slice if it has moved past
+    `first_message_id`; see the per-slice loop in `session_sweeper.sweep()`.
+    """
+    with conn.cursor() as cur:
+        cur.execute(_TRY_SESSION_LOCK_SQL, (session_id,))
+        row = cur.fetchone()
+    return bool(row[0])
+
+
 _CLAIM_INSERT_COLUMNS = "(session_id, first_message_id, last_message_id, message_count)"
 
 _CLAIM_FAST_SQL = f"""

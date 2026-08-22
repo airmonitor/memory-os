@@ -31,6 +31,9 @@ class FakePg:
 
     def ensure_schema(self): self.calls.append("ensure_schema")
 
+    def try_session_lock(self, **kw):
+        return True
+
     def expire_stale_claims(self):
         expired = 0
         for key, status in list(self.claimed.items()):
@@ -343,6 +346,9 @@ class RaisingPg:
 
     def ensure_schema(self):
         raise AssertionError("ensure_schema must not run under --dry-run")
+
+    def try_session_lock(self, **kw):
+        raise AssertionError("try_session_lock must not run under --dry-run")
 
     def watermarks(self):
         return {}
@@ -860,3 +866,98 @@ def test_a_deterministic_failure_reaches_quarantine_after_max_attempts_runs(herm
             assert pg.claimed[("s", 12)] == "quarantined"
             assert result["quarantined"] == 1
     assert pg.attempts[("s", 12)] == CFG["max_attempts"]
+
+
+# ── Task 5: one sweeper per session, released by the transaction ──────────
+
+class LockRefusedPg(FakePg):
+    """Simulates another process already holding the advisory lock for one
+    session. try_session_lock refusing must skip only that candidate — the
+    others still run, and the skip is counted."""
+
+    def __init__(self, refused_session, **kw):
+        super().__init__(**kw)
+        self.refused_session = refused_session
+
+    def try_session_lock(self, **kw):
+        return kw["session_id"] != self.refused_session
+
+
+def test_a_locked_out_session_is_skipped_and_counted_but_others_still_run(hermes_db):
+    now = time.time()
+    sessions, messages, last_ids = two_eligible_sessions(now)
+    pg = LockRefusedPg("s0")
+    deps, written, jobs = make_deps(hermes_db(sessions=sessions, messages=messages), pg)
+    result = sw.sweep(deps, CFG)
+    assert result["candidates"] == 2
+    assert result["locked_out"] == 1
+    assert result["extracted"] == 1
+    # s0 was never claimed at all — another process owns its lock.
+    assert ("s0", last_ids["s0"]) not in pg.claimed
+    assert pg.claimed[("s1", last_ids["s1"])] == "published"
+
+
+class LockBoomOnFirst(FakePg):
+    """Like ClaimBoomOnFirst, but the round trip that fails is the lock
+    itself — a dropped connection, not a lost race. Fail-open per slice."""
+
+    def __init__(self, boom_session, **kw):
+        super().__init__(**kw)
+        self.boom_session = boom_session
+
+    def try_session_lock(self, **kw):
+        if kw["session_id"] == self.boom_session:
+            raise RuntimeError("db down")
+        return super().try_session_lock(**kw)
+
+
+def test_a_lock_failure_does_not_stop_other_candidates(hermes_db):
+    now = time.time()
+    sessions, messages, last_ids = two_eligible_sessions(now)
+    pg = LockBoomOnFirst("s0")
+    deps, written, jobs = make_deps(hermes_db(sessions=sessions, messages=messages), pg)
+    result = sw.sweep(deps, CFG)
+    assert result["candidates"] == 2
+    assert result["extracted"] == 1
+    assert ("s0", last_ids["s0"]) not in pg.claimed
+    assert pg.claimed[("s1", last_ids["s1"])] == "published"
+
+
+class StaleAfterLockPg(FakePg):
+    """Reproduces the race decision 3 exists for: two sweeps both read
+    watermarks() before either locks, so they build slices against the SAME
+    stale watermark. The other sweep wins the lock first, claims, extracts
+    and publishes — advancing the watermark. By the time THIS process's
+    try_session_lock succeeds, a re-read must see that its slice is already
+    covered. A lock with no re-read would miss this entirely: this slice's
+    last_message_id differs from the other sweep's, so the UNIQUE constraint
+    never fires and both would win."""
+
+    def __init__(self, advance_to, **kw):
+        super().__init__(**kw)
+        self._advance_to = advance_to
+        self._locked = False
+
+    def try_session_lock(self, **kw):
+        self._locked = True
+        return True
+
+    def watermarks(self):
+        marks = super().watermarks()
+        if self._locked:
+            marks["s"] = self._advance_to
+        return marks
+
+
+def test_a_slice_built_against_a_stale_watermark_is_dropped_after_locking(hermes_db):
+    now = time.time()
+    sessions, messages = rich_session(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = StaleAfterLockPg(advance_to=12)
+    deps, written, jobs = make_deps(path, pg)
+    result = sw.sweep(deps, CFG)
+    assert result["extracted"] == 0
+    assert result["stale_slices"] == 1
+    assert written == [] and jobs == []
+    # Never claimed either — the other sweep already owns this slice.
+    assert ("s", 12) not in pg.claimed
