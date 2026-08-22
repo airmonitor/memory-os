@@ -86,6 +86,10 @@ litellm:
     extraction:                      # icarus/hooks.py LLM extraction
       name: ${EXTRACTION_MODEL:lm-studio-qwen3.6}
       max_tokens: ${ICARUS_EXTRACTION_MAX_TOKENS:4096}
+      # Client budget for one extraction call. Same rule as the embedding
+      # timeout above: it must exceed the proxy's own upstream timeout plus one
+      # fallback hop, or we hang up before LiteLLM can fail over.
+      timeout: ${EXTRACTION_TIMEOUT:100}
 
 paths:                               # SQLite + local paths — host-specific, set in .env
   hermes_home: ${HERMES_HOME}
@@ -108,6 +112,21 @@ search:
   score_threshold: 0.55
   max_text_len: 8000
   request_timeout: 10
+
+# Session extraction (scripts/session_sweeper.py). Thresholds are policy, and
+# the numbers come from measurement: gaps inside one real Slack thread ran
+# 0-2 min within a burst and 42 min BETWEEN bursts of the same conversation,
+# while different conversations sat 292 min and 1326 min apart. 90 minutes is
+# above the largest in-conversation gap observed and far below the smallest
+# between-conversation one. Raising it merges more into one entry; lowering it
+# below 42 is known to split a real conversation.
+session_extraction:
+  idle_minutes: ${SESSION_IDLE_MINUTES:90}
+  min_messages: ${SESSION_MIN_MESSAGES:4}
+  context_overlap: ${SESSION_CONTEXT_OVERLAP:4}
+  max_lag_hours: ${SESSION_MAX_LAG_HOURS:24}
+  max_per_run: ${SESSION_MAX_PER_RUN:3}
+  quality_threshold: ${SESSION_QUALITY_THRESHOLD:0.2}
 
 logging:
   level: INFO

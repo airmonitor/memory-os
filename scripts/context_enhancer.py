@@ -67,6 +67,7 @@ from psycopg.types.json import Jsonb  # noqa: E402
 # ─── Lineage Registration ───────────────────────────────────────────────────
 
 def register_lineage(
+    *,
     session_id: str,
     query: str,
     retrieved_chunk_ids: List[str],
@@ -76,6 +77,12 @@ def register_lineage(
     """
     Register generation provenance in Postgres (memos.lineage).
     Fail-open: if it fails, log error and return None. Never breaks the critical path.
+
+    KEYWORD-ONLY ON PURPOSE. The old positional signature put
+    generation_context_hash BEFORE generation_model, so a positional caller
+    stored the hash in the model column and the model in the hash column —
+    no error, and the row looked plausible. Rows with a 16-hex
+    generation_model in any deployment are that bug.
     """
     lineage_id = str(uuid.uuid4())
     try:

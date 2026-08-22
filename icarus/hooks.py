@@ -1,16 +1,15 @@
 """Lifecycle hooks — memory capture, decision detection, creative tracking."""
 
-import json
+import hashlib
 import logging
 import os
 import re
 import sys
-import urllib.request
-import urllib.error
 from datetime import datetime
 from pathlib import Path
 
 from . import state
+from .extraction import build_transcript, extract_entries, parse_json_robust  # noqa: F401
 
 # ── Service config (config/services.yaml) ─────────────────────────────────
 # Fall back to a local repo when running from a checkout instead of the Hermes
@@ -28,15 +27,13 @@ except ImportError:
         _svc = None  # config absent → fall back to env at call time
 
 # ── LiteLLM extraction config ──
-_LITELLM_KEY = (_svc.litellm.api_key if _svc else os.environ.get("LITELLM_API_KEY", "")) or ""
-_LITELLM_URL = (_svc.litellm.base_url if _svc else os.environ.get("LITELLM_URL", "")).rstrip("/")
+# Only the model name survives here: extraction itself (and the rest of this
+# block — key, url, max_tokens, timeout) moved to scripts/session_sweeper.py.
+# _EXTRACTION_MODEL is kept because _search_qdrant's lineage write records it
+# as generation_model.
 _EXTRACTION_MODEL = (
     _svc.litellm.models.extraction.name if _svc
     else os.environ.get("ICARUS_EXTRACTION_MODEL", "lm-studio-qwen3.6")
-)
-_EXTRACTION_MAX_TOKENS = int(
-    _svc.litellm.models.extraction.max_tokens if _svc
-    else os.environ.get("ICARUS_EXTRACTION_MAX_TOKENS", "4096")
 )
 
 logger = logging.getLogger(__name__)
@@ -44,19 +41,6 @@ logger = logging.getLogger(__name__)
 # ── Truncation limits (env-configurable) ──
 _RESULT_MAX = int(os.environ.get("ICARUS_RESULT_MAX_CHARS", "500"))
 _TASK_MAX = int(os.environ.get("ICARUS_TASK_MAX_CHARS", "300"))
-
-# ── System injection detection ──
-_SYSTEM_PREFIXES = (
-    "[IMPORTANT:",
-    "[SYSTEM:",
-    "You are running as a scheduled",
-)
-
-
-def _is_system_injection(text):
-    """Return True if text starts with a known orchestrator/system preamble."""
-    stripped = text.strip()
-    return any(stripped.startswith(p) for p in _SYSTEM_PREFIXES)
 
 # use shared regexes from state for decision/outcome/completion detection
 # keep local regexes only for creative tracking (broader set)
@@ -236,9 +220,27 @@ def _search_qdrant(query, top_k=2, threshold=0.72):
             top_k=top_k,
             score_threshold=threshold,
         )
-        return results
     except Exception:
         return []
+
+    # Lineage is telemetry, not part of recall: its own try/except, entirely
+    # inside this function's success path, so a failure here — including the
+    # import itself failing on a version-skewed context_enhancer — can never
+    # cause the results already retrieved above to be discarded.
+    try:
+        from scripts.context_enhancer import register_lineage
+        register_lineage(
+            session_id=state.session_id or "unknown",
+            query=query,
+            retrieved_chunk_ids=[str(r.get("id")) for r in results],
+            generation_context_hash=hashlib.sha256(
+                "".join(str(r.get("id")) for r in results).encode()).hexdigest()[:16],
+            generation_model=_EXTRACTION_MODEL or "unknown",
+        )
+    except Exception as exc:      # lineage is telemetry; recall must not depend on it
+        logger.debug("icarus: lineage write skipped: %s", exc)
+
+    return results
 
 
 # ── Session history search (FTS5 over state.db) ──────────────
@@ -624,236 +626,15 @@ def post_llm_call(session_id="", user_message="", assistant_response="", platfor
         state.save_creative(creative)
 
 
-# ── LLM-powered session extraction ────────────────────────
-
-def _parse_json_robust(raw):
-    """Extract JSON array/object from LLM output with markdown tolerances.
-
-    Handles: ```json fences, leading text, trailing commas, whitespace.
-    Returns parsed value on success, None on failure.
-    """
-    if not raw or not raw.strip():
-        return None
-
-    text = raw.strip()
-
-    # Strip markdown code fences
-    for fence in ("```json", "```"):
-        if text.startswith(fence):
-            text = text[len(fence):].lstrip()
-        if text.endswith("```"):
-            text = text[:-3].rstrip()
-
-    # Find first JSON structure character
-    for start_char in ("[", "{"):
-        idx = text.find(start_char)
-        if idx != -1:
-            text = text[idx:]
-            break
-
-    # Attempt parse; progressively strip trailing characters on failure
-    attempts = 0
-    while attempts < 20:
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            # Strip last char and try again (handles trailing commas, extra })
-            if text:
-                text = text[:-1]
-            attempts += 1
-            continue
-
-    return None
-
-
-def _build_transcript(exchanges):
-    """Build a compact transcript from session exchanges for LLM analysis."""
-    lines = []
-    for i, ex in enumerate(exchanges):
-        user = (ex.get("user") or "").strip()
-        assistant = (ex.get("assistant") or "").strip()
-        if user:
-            lines.append(f"[Turn {i+1} — User]\n{user[:500]}")
-        if assistant:
-            lines.append(f"[Turn {i+1} — Agent]\n{assistant[:800]}")
-    return "\n\n".join(lines)
-
-
-def _llm_extract_entries(transcript):
-    """Use LLM to extract significant entries from session transcript.
-
-    Returns list of dicts: {type, summary, content, training_value}
-    Returns empty list on failure or if nothing worth preserving.
-    """
-    if not _LITELLM_KEY:
-        logger.warning("icarus: no LiteLLM key — skipping LLM extraction")
-        return []
-
-    prompt = (
-        "You are a session archivist for an AI agent. Analyze this agent session "
-        "transcript and extract ONLY significant entries worth preserving in a "
-        "cross-agent knowledge base. Skip trivial sessions, greetings, and routine chatter.\n\n"
-        "For each significant entry, provide:\n"
-        "- type: \"decision\" (technical decision with rationale), "
-        "\"resolution\" (bug fix or problem solved), "
-        "or \"note\" (discovery or learning)\n"
-        "- summary: one line, max 80 chars, in the original language of the session\n"
-        "- content: structured markdown with ## Context, ## Action/Decision, and ## Outcome. "
-        "Include concrete details: commands, paths, error messages, decisions made.\n"
-        "- training_value: \"high\" (outcome verified, artifact produced, decision with evidence), "
-        "\"normal\" (useful context or progress), "
-        "or \"low\" (marginal, but not zero)\n\n"
-        "If the session contains NOTHING worth preserving across sessions, "
-        "return an empty array: []\n\n"
-        "Return ONLY valid JSON array, no other text:\n"
-        '[{"type": "decision", "summary": "...", "content": "...", "training_value": "high"}, ...]'
-    )
-
-    payload = json.dumps({
-        "model": _EXTRACTION_MODEL,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": transcript[:8000]}
-        ],
-        "max_tokens": _EXTRACTION_MAX_TOKENS,
-        "temperature": 0.2
-    }).encode("utf-8")
-
-    try:
-        url = f"{_LITELLM_URL}/chat/completions" if _LITELLM_URL else "https://litellm.airmonitor.pl/v1/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if _LITELLM_KEY:
-            headers["Authorization"] = f"Bearer {_LITELLM_KEY}"
-        req = urllib.request.Request(url, data=payload, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=45)
-        body = json.loads(resp.read().decode("utf-8"))
-        raw = body["choices"][0]["message"]["content"]
-
-        # Parse JSON from response (robust — handles markdown fences, null)
-        if raw is None:
-            raise ValueError("DeepSeek returned content:null (response_format bug)")
-        extracted = _parse_json_robust(raw)
-        if isinstance(extracted, dict):
-            # Some models return {entries: [...]} — unwrap
-            for key in ("entries", "results", "items"):
-                if key in extracted and isinstance(extracted[key], list):
-                    extracted = extracted[key]
-                    break
-            else:
-                # Single entry wrapped in dict
-                if "type" in extracted:
-                    extracted = [extracted]
-                else:
-                    extracted = []
-
-        if not isinstance(extracted, list):
-            logger.warning("icarus: LLM extraction returned non-list: %s", type(extracted))
-            return []
-
-        # Validate and filter
-        valid = []
-        allowed_types = {"decision", "resolution", "note"}
-        for entry in extracted:
-            if not isinstance(entry, dict):
-                continue
-            etype = entry.get("type", "")
-            summary = entry.get("summary", "")
-            content = entry.get("content", "")
-            if etype not in allowed_types:
-                continue
-            if len(summary) < 10 or len(content) < 60:
-                continue
-            valid.append({
-                "type": etype,
-                "summary": summary[:80],
-                "content": content[:2000],
-                "training_value": entry.get("training_value", "normal")
-            })
-
-        return valid
-
-    except (urllib.error.URLError, json.JSONDecodeError, KeyError, IndexError, ValueError,
-            ConnectionError, TimeoutError, OSError) as e:
-        logger.warning("icarus: LLM extraction failed (%s) — falling back to legacy", type(e).__name__)
-        return []
-
-
-def _legacy_session_write(platform, scores):
-    """Fallback: original truncated session write (pre-LLM behavior)."""
-    plat = platform or "cli"
-    parts = []
-
-    first_user = next(
-        (
-            ex["user"] for ex in state.exchanges
-            if len(ex.get("user", "").strip()) > 50
-            and not _is_system_injection(ex.get("user", ""))
-        ),
-        None
-    )
-    if first_user:
-        parts.append(f"## Task\n{first_user[:_TASK_MAX]}")
-
-    for ex in state.exchanges:
-        resp = ex.get("assistant", "")
-        if state.DECISION_RE.search(resp) and len(resp) > 100:
-            parts.append(f"## Decision\n{resp[:500]}")
-            break
-
-    substantive = [ex for ex in state.exchanges if len(ex.get("assistant", "").strip()) > 100]
-    if substantive:
-        parts.append(f"## Result\n{substantive[-1]['assistant'][:_RESULT_MAX]}")
-
-    content = "\n\n".join(parts) if parts else state.exchanges[-1].get("assistant", "")[:500]
-
-    if substantive:
-        result_text = substantive[-1]['assistant']
-    else:
-        result_text = content
-    summary = re.sub(r"\s+", " ", result_text.replace("\n", " ")).strip()[:80]
-    summary = re.sub(r"-{2,}", "—", summary)  # sanitize: prevent YAML frontmatter breakage
-
-    if scores["total"] >= 0.6:
-        tv = "high"
-    elif scores["total"] >= 0.3:
-        tv = "normal"
-    else:
-        tv = "low"
-
-    state.write_entry("session", content, summary, platform=plat,
-                     training_value=tv, status="completed")
-
-
 def on_session_end(session_id="", platform="", completed=False, **kwargs):
-    """Score session, extract entries via LLM, fall back to legacy truncation."""
+    """Persist the creative memory file. EXTRACTION NO LONGER HAPPENS HERE.
+
+    On hermes_agent 0.20.4 this hook fires once per user message
+    (agent/turn_finalizer.py:812), and `state.exchanges` is module-level, so in
+    gateway mode it also blends concurrent Slack threads into one list. Session
+    extraction moved to scripts/session_sweeper.py, which reads the
+    authoritative transcript out of Hermes' own state.db.
+    See docs/adr/0001-session-extraction-via-state-db-sweeper.md.
+    """
     creative = state.load_creative()
     state.write_memory_file(creative)
-
-    if not state.exchanges:
-        return
-
-    scores = state.score_session()
-    if scores["total"] < 0.2:
-        return
-
-    plat = platform or "cli"
-
-    # ── LLM extraction (primary) ──
-    transcript = _build_transcript(state.exchanges)
-    entries = _llm_extract_entries(transcript)
-
-    if entries:
-        for entry in entries:
-            state.write_entry(
-                entry["type"],
-                entry["content"],
-                entry["summary"],
-                platform=plat,
-                training_value=entry.get("training_value", "normal"),
-                status="completed"
-            )
-        logger.info("icarus: LLM extracted %d entries from session", len(entries))
-    else:
-        # ── Legacy fallback ──
-        logger.info("icarus: LLM extraction produced nothing — using legacy truncation")
-        _legacy_session_write(platform, scores)
