@@ -307,10 +307,16 @@ def test_mark_failed_returns_the_incremented_attempts_count(conn):
     # A transient failure must not move the counter at all.
     assert session_store.mark_failed(conn, session_id=sid, last_message_id=9,
                                      error="gateway timeout", count_attempt=False) == (1, 2)
-    # The row is 'failed' after mark_failed, so claim()'s reclaim arm re-wins it
-    # without touching attempts - only mark_failed(count_attempt=True) does.
-    session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
-                        message_count=4)
+    # THIS CLAIM LOSES, and saying so is the point. The comment here used to
+    # read "the row is 'failed', so claim()'s reclaim arm re-wins it" -- true
+    # before ADR-0003 decision 3, false after it: mark_failed just scheduled
+    # next_retry_at 15 minutes out, and the reclaim arm now requires the row to
+    # be DUE as well as failed. The counter below moves anyway, because
+    # _MARK_FAILED_SQL is a keyed UPDATE that never looks at `status`. That is
+    # exactly how a stale belief survives a green test, so the assert is here
+    # rather than the assumption.
+    assert session_store.claim(conn, session_id=sid, first_message_id=1,
+                               last_message_id=9, message_count=4) is False
     assert session_store.mark_failed(conn, session_id=sid, last_message_id=9,
                                      error="bad json again", count_attempt=True) == (2, 3)
 
