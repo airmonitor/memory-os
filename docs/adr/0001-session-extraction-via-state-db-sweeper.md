@@ -151,15 +151,28 @@ State machine in PostgreSQL, table `session_extraction`, `UNIQUE (session_id, la
    written to a temporary file and `os.replace()`d into place, so a retry overwrites atomically
    rather than multiplying entries.
 4. **Dispatch** — ARQ `enqueue_job(..., _job_id=f"ingest:{session_id}:{last_message_id}:{i}")`.
-   arq 0.28 refuses a duplicate job id, so re-running after a crash cannot double-ingest.
+   arq refuses a duplicate job id **only while that job's result key still exists**, and
+   `keep_result` is 3600 s in `config/services.yaml`. So re-dispatch is a no-op for one hour
+   after the first delivery, not forever; a replay later than that enqueues again, and because
+   `ingest_memory` assigns a fresh `uuid.uuid4()` per point, the second run writes a duplicate
+   Qdrant point rather than overwriting the first. What is guaranteed unconditionally: no
+   second LLM call, and no second fabric file (deterministic filename, `os.replace`). Making
+   the point id deterministic is the real fix; it belongs in the worker image
+   (`docker/worker/tasks/ingestion.py`) and is tracked separately.
    The outbox row is marked `published` only after the enqueue returns; a crash in between
-   leaves `status='extracted'` **with the entry text stored on the claim row**, and every
-   sweep drains those before doing new work — re-dispatching under the same job id and paying
-   no second LLM call.
+   leaves `status='extracted'` **with the entry text and its fabric fields stored on the claim
+   row**, and every sweep drains those before doing new work — rewriting the fabric files and
+   re-dispatching under the same job ids, paying no second LLM call. The payload carries both
+   halves deliberately: when it held only the job text, a failed fabric write ended with the
+   memory in Qdrant and no entry on disk.
 5. **Reclaim** — a row stuck at `claimed` for more than `STALE_CLAIM_HOURS` (a crash between
    claim and extraction) is re-claimable, as is a `failed` row. Without that rule the unique
    key turns one crash into one permanently lost conversation, because `watermarks()` counts
-   the abandoned row.
+   the abandoned row. The reclaim cannot live in `claim()`'s `ON CONFLICT` alone: the stuck
+   row is *why* the slice never becomes a candidate, so `claim()` is never called with that
+   key and the conflict never happens. `expire_stale_claims()` therefore runs as the first
+   statement of every sweep, before `watermarks()` is read, rewriting stale `claimed` rows to
+   `failed`; the existing failed-row machinery then re-offers the slice unchanged.
 
 ### 4. Transcript fidelity
 
@@ -178,12 +191,17 @@ replaced. The hook's extraction is disabled; its creative-memory write stays.
 
 ### 5. Compatibility and observability
 
-- The reader records `schema_version` (26 today) and the set of columns it needs. An unknown
-  version is not fatal but is logged as `SCHEMA-DRIFT` once per run and recorded in the
-  status row, because refusing to sweep on an upgrade would be a silent memory outage of a
-  different shape.
+- The reader records `schema_version` (26 today) and compares it against
+  `hermes_state.KNOWN_SCHEMA_VERSION`. An unknown version is not fatal but is logged as
+  `SCHEMA-DRIFT` once per run, with both numbers, and recorded in the status row, because
+  refusing to sweep on an upgrade would be a silent memory outage of a different shape.
+  Recording the number without comparing it would not have been the promise: nothing would
+  have raised its voice.
 - Every run writes a `sweeper_status` row: timestamp, candidates seen, slices extracted,
-  entries written, jobs enqueued, and the last error. **"Stalled" becomes a query, not an
+  entries written, jobs enqueued, slices re-dispatched, and the last error. `redispatched` is
+  there because a backlog that never drains is a stall of its own shape: those slices are
+  re-offered every sweep, so a count that never falls to zero means the broker is not taking
+  them. **"Stalled" becomes a query, not an
   inspection** — which is what was missing when `memoryos-reflection-trigger` failed 32 times
   unnoticed.
 - Backfill and rollback are one statement each: delete rows from `session_extraction` for a

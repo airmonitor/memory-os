@@ -216,9 +216,23 @@ Add to crontab (`crontab -e`):
 
 # Idle micro-reflection trigger
 */5 * * * * /usr/bin/python3 /path/to/scripts/reflection_trigger.py
+
+# Session sweeper — extracts finished conversation slices from Hermes' state.db
+# into fabric entries and enqueues them for Qdrant ingestion. WITHOUT THIS LINE
+# the install is inert: layer 4 writes nothing on modern Hermes, so a fresh host
+# sits at fabric 0 / qdrant 0 / lineage 0 with no error anywhere.
+*/15 * * * * /usr/bin/flock -n /tmp/memoryos-sweeper.lock $VENV_DIR/bin/python $PROJECT_DIR/scripts/session_sweeper.py >> $HERMES_LOG_DIR/session_sweeper.cron.log 2>&1
 ```
 
 Cron jobs read the same `config/services.yaml` as the worker — no extra env wiring needed beyond the `.env` secrets.
+
+The sweeper line differs from the others on purpose:
+
+- `$VENV_DIR` is the virtualenv holding this repo's requirements (typically `/opt/agent/venv`), `$PROJECT_DIR` is the checkout (typically `/opt/agent/memory-os`), `$HERMES_LOG_DIR` is where the agent's logs live. Substitute real paths — cron does not read your shell profile. The sweeper needs the venv interpreter, not `/usr/bin/python3`, because it imports `arq` and `psycopg`.
+- `flock -n` makes an overrun a no-op instead of a pile-up: an extraction is an LLM call, and a slow one must not have a second sweeper claiming beside it every 15 minutes.
+- Output is appended to a log because a sweeper that fails at import time never reaches the `sweeper_status` row that would otherwise report it.
+
+See [`docs/session-sweeper.md`](../docs/session-sweeper.md) for what to watch afterwards.
 
 ## 11. Verify
 
