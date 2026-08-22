@@ -1,6 +1,10 @@
 import io
 import json
+
+import pytest
+
 from icarus import extraction
+from icarus.extraction import ExtractionFailed
 
 
 def fake_opener(payload, *, capture=None):
@@ -45,10 +49,14 @@ def test_the_configured_timeout_reaches_the_http_call():
     assert capture["url"] == "http://x/v1/chat/completions"
 
 
-def test_malformed_output_yields_no_entries_and_does_not_raise():
-    assert extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
-                                      max_tokens=10, timeout=5,
-                                      opener=fake_opener("not json at all")) == []
+def test_malformed_output_raises_instead_of_looking_like_an_empty_session():
+    """This test used to assert `== []`, and that assertion WAS the Critical bug:
+    on the sweeper path an empty list marks the slice extracted and published,
+    advancing the watermark past a conversation nobody ever read."""
+    with pytest.raises(ExtractionFailed):
+        extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
+                                   max_tokens=10, timeout=5,
+                                   opener=fake_opener("not json at all"))
 
 
 def test_entries_missing_required_fields_are_dropped():
@@ -58,12 +66,85 @@ def test_entries_missing_required_fields_are_dropped():
     assert [e["summary"] for e in out] == [SUMMARY]
 
 
-def test_no_api_key_means_no_call():
+def test_no_api_key_means_no_call_and_no_silent_empty_result():
+    """No key still means no gateway call — but it must not read as "nothing
+    worth keeping" either, or a misconfigured host burns its entire backlog
+    three slices per sweep while every counter reads healthy."""
     def explode(*a, **k):
         raise AssertionError("must not call the gateway without a key")
-    assert extraction.extract_entries("t", base_url="http://x/v1", api_key="",
-                                      model="m", max_tokens=10, timeout=5,
-                                      opener=explode) == []
+    with pytest.raises(ExtractionFailed):
+        extraction.extract_entries("t", base_url="http://x/v1", api_key="",
+                                   model="m", max_tokens=10, timeout=5,
+                                   opener=explode)
+
+
+# ── The empty-vs-failed distinction (fix round 2) ──────────────────────────
+
+def test_a_genuine_empty_array_is_still_an_empty_list():
+    """The one case that must NOT raise: the model read the transcript and said
+    there is nothing here. Everything else raising is only safe if this does not."""
+    assert extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
+                                      max_tokens=10, timeout=5,
+                                      opener=fake_opener("[]")) == []
+
+
+def test_a_transport_failure_raises_extraction_failed():
+    def timing_out(req, timeout=None):
+        raise TimeoutError("the read operation timed out")
+    with pytest.raises(ExtractionFailed) as exc:
+        extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
+                                   max_tokens=10, timeout=5, opener=timing_out)
+    # The cause is chained so mark_failed's stored error is diagnostic.
+    assert isinstance(exc.value.__cause__, TimeoutError)
+
+
+def test_a_response_that_is_not_a_chat_completion_raises():
+    def wrong_shape(req, timeout=None):
+        return io.BytesIO(json.dumps({"error": "model not found"}).encode())
+    with pytest.raises(ExtractionFailed):
+        extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
+                                   max_tokens=10, timeout=5, opener=wrong_shape)
+
+
+def test_entries_dropped_by_validation_are_not_a_failure():
+    """The model was asked and it answered; the answer was junk. That is
+    "nothing worth keeping", not "the call did not happen"."""
+    raw = json.dumps([{"type": "decision", "summary": "x", "content": "y"}])
+    assert extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
+                                      max_tokens=10, timeout=5,
+                                      opener=fake_opener(raw)) == []
+
+
+def test_parse_json_robust_stays_lenient_for_the_plugin_surface():
+    assert extraction.parse_json_robust("not json at all") == []
+
+
+# ── Transcript budget (fix round 2) ────────────────────────────────────────
+
+def test_an_overlong_transcript_keeps_its_tail_and_says_what_it_dropped():
+    """A 35-message Slack thread runs 15-20k chars; `transcript[:8000]` kept the
+    greeting and threw away the outcome, while scoring ran on the whole slice."""
+    text = "HEAD-GREETING" + ("x" * 20000) + "TAIL-OUTCOME"
+    out = extraction.clamp_transcript(text)
+    assert out.endswith("TAIL-OUTCOME")
+    assert "HEAD-GREETING" not in out
+    dropped = len(text) - extraction.TRANSCRIPT_MAX_CHARS
+    assert f"{dropped} earlier characters elided" in out
+
+
+def test_a_transcript_within_budget_is_untouched():
+    assert extraction.clamp_transcript("short") == "short"
+
+
+def test_the_clamped_transcript_is_what_reaches_the_request_body():
+    capture = {}
+    text = "HEAD-GREETING" + ("x" * 20000) + "TAIL-OUTCOME"
+    extraction.extract_entries(text, base_url="http://x/v1", api_key="k", model="m",
+                               max_tokens=10, timeout=5,
+                               opener=fake_opener("[]", capture=capture))
+    sent = capture["body"]["messages"][1]["content"]
+    assert sent.endswith("TAIL-OUTCOME")
+    assert "elided" in sent
 
 
 # ── Restored guarantees (fix round 1) ──────────────────────────────────────
