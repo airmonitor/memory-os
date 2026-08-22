@@ -15,8 +15,11 @@ The third leg is weaker than it used to be written. arq refuses a duplicate
 after the first delivery, not forever. A replay later than that enqueues again,
 and because `ingest_memory` assigns a fresh `uuid.uuid4()` per point, the
 second run writes a DUPLICATE Qdrant point rather than overwriting the first.
-What is guaranteed: no second LLM call, no second fabric file, and no double
-ingestion inside the result-retention window. Making the point id deterministic
+What is guaranteed: no second fabric file, no double ingestion inside the
+result-retention window, and no second LLM call once `mark_extracted` has
+banked the payload — a crash in the window between the model answering and that
+commit leaves the row at 'claimed', and the reclaim correctly pays for the call
+again, because at that point nothing durable exists to reuse. Making the point id deterministic
 is the real fix; it belongs in the worker image
 (`docker/worker/tasks/ingestion.py`) and is tracked separately.
 

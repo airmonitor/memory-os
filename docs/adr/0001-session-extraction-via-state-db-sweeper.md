@@ -156,7 +156,9 @@ State machine in PostgreSQL, table `session_extraction`, `UNIQUE (session_id, la
    after the first delivery, not forever; a replay later than that enqueues again, and because
    `ingest_memory` assigns a fresh `uuid.uuid4()` per point, the second run writes a duplicate
    Qdrant point rather than overwriting the first. What is guaranteed unconditionally: no
-   second LLM call, and no second fabric file (deterministic filename, `os.replace`). Making
+   second fabric file (deterministic filename, `os.replace`); and no second LLM call once
+   `mark_extracted` has banked the payload — a crash between the model answering and that
+   commit re-pays for the call once, since nothing durable exists yet to reuse. Making
    the point id deterministic is the real fix; it belongs in the worker image
    (`docker/worker/tasks/ingestion.py`) and is tracked separately.
    The outbox row is marked `published` only after the enqueue returns; a crash in between
