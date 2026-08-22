@@ -132,7 +132,7 @@ MEMOS_TEST_DSN=postgresql://postgres:test@localhost:55432/postgres .venv/bin/pyt
 docker rm -f memos-test-pg
 ```
 
-Or select just this file by marker: `.venv/bin/pytest -m integration` (still needs `MEMOS_TEST_DSN`, or every test in it skips). Each test claims a randomly-suffixed `session_id`, and the `conn` fixture drops both tables on teardown — the file is safe to run twice against the same database, and safe to point at a shared test database another session is also using.
+Or select just this file by marker: `.venv/bin/pytest -m integration` (still needs `MEMOS_TEST_DSN`, or every test in it skips). Each test claims a randomly-suffixed `session_id`, and the `conn` fixture drops both `session_extraction` and `sweeper_status` on teardown — that makes the file safe to run again, in sequence, against the same database (measured: three runs in a row, same container, all passed). It does **not** make the file safe to run concurrently, or to point at any database something else is using: two overlapping runs' teardowns race on dropping each other's tables, and pointing this at a shared database — a colleague's, or a real deployment's — drops that database's own `session_extraction`/`sweeper_status` bookkeeping the moment the first test in this file finishes. Use a throwaway database or container, one run at a time.
 
 ## Acceptance Criteria
 

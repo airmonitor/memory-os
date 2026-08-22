@@ -11,8 +11,12 @@ Skipped unless MEMOS_TEST_DSN is set, so the default suite stays offline:
     MEMOS_TEST_DSN=postgresql://user:pass@localhost:5432/memos_test .venv/bin/pytest -m integration
 
 Each test claims a fresh, randomly-suffixed session_id and the `conn` fixture
-drops both tables on teardown, so the file can run twice against the same
-database without colliding with itself or with a previous run.
+drops both tables on teardown, so the file can run twice IN SEQUENCE against
+the same database without colliding with a previous run. That teardown is
+also why two runs must never overlap and this must never point at a database
+anything else is using: a concurrent run's DROP TABLE deletes the other run's
+rows out from under it, and pointing this at a shared database drops that
+database's own session_extraction/sweeper_status bookkeeping.
 """
 import os
 import uuid
@@ -30,6 +34,15 @@ def conn():
     c = psycopg.connect(DSN)
     session_store.ensure_schema(c)
     yield c
+    # A genuine psycopg.Error mid-test (not just an AssertionError) leaves the
+    # connection INERROR, and a transaction in that state rejects everything,
+    # including this teardown's own DROP TABLE, with "current transaction is
+    # aborted". Left unhandled, that leaks the tables and their rows into the
+    # database and breaks the next run's exact-count assertions - the very
+    # property the module docstring above promises for sequential re-runs.
+    # rollback() is a no-op on an already-clean transaction, so it is safe to
+    # call unconditionally here.
+    c.rollback()
     with c.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS session_extraction, sweeper_status")
     c.commit()
@@ -60,10 +73,52 @@ def test_a_stale_claim_is_reclaimable(conn):
     # A crash between claim and extraction is transient by nature - OOM, eviction,
     # a rolled pod. Reclaiming must neither increment attempts (three crashes would
     # quarantine a slice that never once failed deterministically) nor reset them
-    # (the count would never accumulate across crash cycles).
+    # (the count would never accumulate across crash cycles). Asserting `== 0`
+    # here cannot tell "never touched" from "reset to zero by a bug" - attempts
+    # started at 0, so both land on the same value. See the second half below,
+    # which starts attempts at 1, for the assertion that can actually fail.
     with conn.cursor() as cur:
         cur.execute("SELECT attempts FROM session_extraction WHERE session_id = %s", (sid,))
         assert cur.fetchone()[0] == 0
+
+
+def test_a_stale_claim_with_a_prior_failure_keeps_its_attempts_count(conn):
+    """The other half of the previous test's docstring. A row that has
+    already failed deterministically once (attempts == 1) is reclaimed, then
+    crashes before extraction finishes and goes stale - that reclaim, and the
+    stale-recovery cycle that follows (expire_stale_claims, then claim()
+    again), must leave attempts at 1, not reset it to 0. Starting from a
+    non-zero count is what lets this test actually fail if either of those
+    ever touched `attempts` - the previous test's `== 0` cannot, because
+    attempts started at 0 there too."""
+    from scripts import session_store
+    sid = f"s-{uuid.uuid4()}"
+    session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
+                        message_count=4)
+    assert session_store.mark_failed(conn, session_id=sid, last_message_id=9,
+                                     error="bad json", count_attempt=True) == 1
+    # Reclaim the now-'failed' row via claim()'s 'failed' reclaim arm, so the
+    # row goes back to 'claimed' with attempts == 1 before it goes stale below.
+    assert session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
+                               message_count=4) is True
+    with conn.cursor() as cur:
+        cur.execute("UPDATE session_extraction SET updated_at = now() - interval '3 hours' "
+                    "WHERE session_id = %s", (sid,))
+    conn.commit()
+    assert session_store.expire_stale_claims(conn, stale_hours=2) == 1
+    with conn.cursor() as cur:
+        cur.execute("SELECT attempts FROM session_extraction WHERE session_id = %s", (sid,))
+        assert cur.fetchone()[0] == 1  # expire_stale_claims must not touch it
+    assert session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
+                               message_count=4) is True
+    with conn.cursor() as cur:
+        cur.execute("SELECT attempts FROM session_extraction WHERE session_id = %s", (sid,))
+        # expire_stale_claims already set status back to 'failed', so this
+        # claim() reclaims via the 'failed' arm again (not the stale-'claimed'
+        # arm - that one only fires for a row still 'claimed' when claim() is
+        # called, which expire_stale_claims running first makes rare; see its
+        # own docstring). Either arm must leave attempts alone.
+        assert cur.fetchone()[0] == 1
 
 
 def test_the_payload_round_trips_as_jsonb(conn):
