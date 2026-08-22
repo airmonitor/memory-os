@@ -31,6 +31,7 @@ from arq import cron  # noqa: E402
 from arq.connections import RedisSettings  # noqa: E402
 
 from tasks.ingestion import ingest_memory  # noqa: E402
+from transient import retry_or_raise  # noqa: E402
 from tasks.reflection import reflect_on_memories, micro_reflection  # noqa: E402
 from tasks.file_ingestion import ingest_file  # noqa: E402
 from services.db import get_pool, close_pool  # noqa: E402
@@ -85,10 +86,21 @@ async def process_ingestion(ctx, memory_text: str, source: str, tags: list = Non
     Only the session sweeper passes it, to make a replayed dispatch upsert
     its point instead of adding a second one; legacy points already in Qdrant
     are not migrated by this.
+
+    A TRANSIENT FAILURE IS RETRIED HERE OR NOWHERE. The producer marks the
+    slice `published` the moment Valkey accepts this job, and its redispatch
+    pass reads only `extracted` rows — so it can never reach this job again.
+    arq retries on `Retry` and nothing else, so without the conversion below
+    one embedding timeout meant a fabric entry with no Qdrant point and no
+    counter anywhere saying so. See transient.py.
     """
-    return await ingest_memory(ctx["qdrant"], memory_text, source, tags,
-                               point_id=point_id, session_id=session_id,
-                               last_message_id=last_message_id)
+    try:
+        return await ingest_memory(ctx["qdrant"], memory_text, source, tags,
+                                   point_id=point_id, session_id=session_id,
+                                   last_message_id=last_message_id)
+    except Exception as exc:
+        # Raises: `Retry` for weather, the original exception for a bad payload.
+        retry_or_raise(exc, job_try=int(ctx.get("job_try", 1)))
 
 
 async def process_wiki_file(ctx, file_path: str):
