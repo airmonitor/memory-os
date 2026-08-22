@@ -22,10 +22,13 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
+# memos_config's import puts vendor/ (--target install dir in the deployed pod)
+# on sys.path as a side effect — anything vendored imported above this line
+# raises ModuleNotFoundError there. See scripts/db.py.
+from memos_config import config
+
 import psycopg
 from psycopg.types.json import Jsonb
-
-from memos_config import config
 
 BATCH = 1000
 

@@ -12,16 +12,19 @@ import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
 
-from arq import create_pool
-from arq.connections import RedisSettings
-import redis.asyncio as aioredis
-
 # ─── Config (config/services.yaml) ──────────────────────────────────────────
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from memos_config import config  # noqa: E402
+
+# memos_config's import (above) puts vendor/ (--target install dir in the
+# deployed pod) on sys.path as a side effect — anything vendored imported
+# above this line raises ModuleNotFoundError there. See scripts/db.py.
+from arq import create_pool  # noqa: E402
+from arq.connections import RedisSettings  # noqa: E402
+import redis.asyncio as aioredis  # noqa: E402
 
 WIKI_ROOT = Path(os.environ.get("WIKI_ROOT", str(config.paths.wiki_root)))
 STATE_DIR = Path(os.environ.get("HERMES_STATE_DIR", str(config.paths.hermes_home)))

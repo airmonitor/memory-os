@@ -22,16 +22,19 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 
-from arq import create_pool
-from arq.connections import RedisSettings
-import redis.asyncio as aioredis
-
 # ─── Config (config/services.yaml) ──────────────────────────────────────────
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from memos_config import config  # noqa: E402
+
+# memos_config's import (above) puts vendor/ (--target install dir in the
+# deployed pod) on sys.path as a side effect — this is the exact shape that
+# cost this script its first 32 runs when arq/redis were imported above it.
+from arq import create_pool  # noqa: E402
+from arq.connections import RedisSettings  # noqa: E402
+import redis.asyncio as aioredis  # noqa: E402
 from scripts.db import get_conn  # noqa: E402
 
 REDIS_HOST = config.valkey.host

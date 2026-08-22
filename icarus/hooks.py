@@ -229,12 +229,17 @@ def _search_qdrant(query, top_k=2, threshold=0.72):
     # cause the results already retrieved above to be discarded.
     try:
         from scripts.context_enhancer import register_lineage
+        # 32 hex chars, matching scripts/context_enhancer.py's writer into the
+        # same generation_context_hash column. The forensic marker documented
+        # on register_lineage ("a 16-hex value in generation_model means a
+        # positional caller swapped hash and model") is about which column a
+        # hash lands in, not about a hash's width, so it still holds at 32.
         register_lineage(
             session_id=state.session_id or "unknown",
             query=query,
             retrieved_chunk_ids=[str(r.get("id")) for r in results],
             generation_context_hash=hashlib.sha256(
-                "".join(str(r.get("id")) for r in results).encode()).hexdigest()[:16],
+                "".join(str(r.get("id")) for r in results).encode()).hexdigest()[:32],
             generation_model=_EXTRACTION_MODEL or "unknown",
         )
     except Exception as exc:      # lineage is telemetry; recall must not depend on it
