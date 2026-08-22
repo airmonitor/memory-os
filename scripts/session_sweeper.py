@@ -174,7 +174,7 @@ def sweep(deps: Deps, cfg: dict) -> dict:
 
     stats = {"candidates": 0, "extracted": 0, "entries": 0, "jobs": 0,
              "quarantined": 0, "aborted": False, "locked_out": 0, "stale_slices": 0,
-             "redispatched": redispatch(deps)}
+             "last_error": None, "redispatched": redispatch(deps)}
     marks = deps.pg.watermarks()
     warned_compacted = False
 
@@ -326,6 +326,14 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                                cand.session_id, last_id, exc)
                 deps.pg.mark_failed(session_id=cand.session_id, last_message_id=last_id,
                                     error=exc, count_attempt=False)
+                if getattr(exc, "configuration_error", False):
+                    # Will not fix itself on retry, and the run stays fail-open
+                    # (no quarantine), so a run that never crashes and never
+                    # aborts would otherwise leave no trace of it anywhere an
+                    # operator queries first. Set BEFORE the transient_abort
+                    # check below: two consecutive 401s trip that breaker right
+                    # here, and that is exactly the run this must not go NULL for.
+                    stats["last_error"] = str(exc)
                 transient_streak += 1
                 if transient_streak >= cfg["transient_abort"]:
                     logger.warning(
@@ -511,10 +519,30 @@ class _Enqueuer:
         self._loop = asyncio.new_event_loop()
         self._pool = self._loop.run_until_complete(create_pool(redis_settings))
 
-    def __call__(self, job, *args, job_id, point_id=None):
-        kwargs = {"point_id": point_id} if point_id is not None else {}
-        return self._loop.run_until_complete(
+    def __call__(self, job, *args, job_id, **kw):
+        """Raise when arq refuses the job id, instead of returning None quietly.
+
+        `enqueue_job` returns None when a job with this id is already known -
+        which, because `keep_result` keeps a FAILED job's result key exactly as
+        long as a successful one's, is also what happens when you retry a
+        delivery the worker rejected. Measured on the semitora host 2026-08-22:
+        two memories were dispatched to a worker that raised TypeError on them,
+        the rows were marked published, and every later repair attempt inside
+        the next hour returned None while the sweeper counted it as sent. The
+        repair only worked after deleting `arq:result:ingest:…` by hand.
+
+        A dispatch that silently did nothing must not look like a dispatch that
+        worked. The caller leaves the row at 'extracted' on this exception, so
+        the next sweep tries again - and once the result key expires, succeeds.
+        """
+        kwargs = {k: v for k, v in kw.items() if v is not None}
+        job_ref = self._loop.run_until_complete(
             self._pool.enqueue_job(job, *args, _job_id=job_id, **kwargs))
+        if job_ref is None:
+            raise RuntimeError(
+                f"arq refused job id {job_id}: a result key for it still exists "
+                f"(keep_result). Nothing was enqueued.")
+        return job_ref
 
     def close(self):
         self._loop.run_until_complete(self._pool.aclose())
@@ -649,6 +677,17 @@ def main(argv=None) -> dict:
         # healthy run, for a gateway that is failing every slice it touches.
         # `aborted`/`locked_out`/`stale_slices` are what make that queryable
         # (fix wave 2026-08-22; see session_store.record_run).
+        #
+        # `error` prefers the crash (`error`, set in the except above, non-NULL
+        # only when sweep() itself raised) over `r["last_error"]` — the last
+        # ExtractionFailed this run saw with `configuration_error=True` (a 4xx
+        # that is not 429). That second source is what makes a config problem
+        # visible here at all: it never raises out of sweep() (fail-open, ticket
+        # #17) and never trips `aborted` on its own, so without it a run that
+        # spent every slice failing on a rotated key would still write
+        # `error=NULL` — indistinguishable from a healthy one except by reading
+        # `session_extraction.error` directly, which is exactly the blind spot
+        # this column exists to remove.
         r = result or {}
         try:
             deps.pg.record_run(
@@ -657,7 +696,8 @@ def main(argv=None) -> dict:
                 redispatched=r.get("redispatched", 0), quarantined=r.get("quarantined", 0),
                 aborted=r.get("aborted", False), locked_out=r.get("locked_out", 0),
                 stale_slices=r.get("stale_slices", 0),
-                schema_version=hermes_state.schema_version(sqlite_conn), error=error)
+                schema_version=hermes_state.schema_version(sqlite_conn),
+                error=error or r.get("last_error"))
         except Exception:
             logger.exception("failed to record sweeper_status row")
         sqlite_conn.close()

@@ -132,6 +132,29 @@ def test_a_quiet_substantive_session_is_extracted_published_and_dispatched(herme
     assert jobs == [sw.job_id("s", 12, 0)]
 
 
+def test_a_dispatch_arq_refused_leaves_the_slice_re_runnable(hermes_db):
+    """arq returns None when the job id is already known - including for a job
+    that FAILED, because keep_result keeps a failed result key exactly as long
+    as a successful one. Counting that as sent is a silent loss: it happened on
+    the semitora host, twice, to the same two memories.
+    """
+    now = time.time()
+    sessions, messages = rich_session(now)
+    pg = FakePg()
+
+    def refused(job, *args, job_id, **kw):
+        raise RuntimeError(f"arq refused job id {job_id}")
+
+    deps, _, _ = make_deps(hermes_db(sessions=sessions, messages=messages), pg,
+                           enqueue=refused)
+    result = sw.sweep(deps, CFG)
+    assert result["jobs"] == 0
+    # extracted, not published: the next sweep re-dispatches from the payload,
+    # and once the result key expires it goes through.
+    assert pg.claimed[("s", 12)] == "extracted"
+    assert pg.pending_dispatch(), "the slice must remain dispatchable"
+
+
 def test_every_dispatched_job_carries_its_conversation_provenance(hermes_db):
     """Without these two fields nothing in a Qdrant point says WHICH conversation
     it came from: `source` is the constant "session" for every point the sweeper
