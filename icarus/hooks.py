@@ -374,73 +374,14 @@ def _search_facts(query, top_k=3):
 
 
 # ── Prompt injection sanitization ────────────────────────────
+# Moved to icarus/sanitize.py so the extraction path can reuse it; these are
+# kept as aliases so no call site in this file needs to change.
 
-_INJECTION_PATTERNS = [
-    # "ignore all previous/prior instructions/directives"
-    (re.compile(r"(?i)\bignore\s+all\s+(previous|prior)\s+(instructions|directives|commands|messages|prompts|context)"),
-     "[REDACTED]"),
-    # "you are/will now become/act/acting as (a/an) AI/assistant..."
-    (re.compile(r"(?i)\byou\s+(are|will\s+now)\s+(now\s+)?(become|act|acting)\s+as\s+(a\s+|an\s+)?(AI\s+assistant|assistant|AI|agent|LLM|chatbot|model|system)"),
-     "[REDACTED]"),
-    # "new instructions/directives/commands follow/above/below"
-    (re.compile(r"(?i)\bnew\s+(instructions|directives|commands)\s+(follow|above|below)"),
-     "[REDACTED]"),
-    # Template injection: {{...}}, ${...}
-    (re.compile(r"\{\{.*?\}\}|\$\{.*?\}"), "[REDACTED]"),
-    # Triple-backtick code fences
-    (re.compile(r"```"), "[code]"),
-    # Markdown/javascript data: URLs in links and images
-    (re.compile(r"(?i)(javascript|data)\s*:"), "sanitized:"),
-    # XML/HTML injection: <script>, event handlers, iframes
-    (re.compile(r"<\s*script[\s>]|on\w+\s*=|<\s*iframe[\s>]"), "[sanitized]"),
-    # Known system prefixes
-    (re.compile(r"(?i)\[IMPORTANT:.*?\]|\[SYSTEM:.*?\]|\[OVERRIDE:.*?\]"), "[REDACTED]"),
-    # Control characters (keep newlines and tabs)
-    (re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"), ""),
-    # Zero-width and invisible Unicode
-    (re.compile(r"[\u200b-\u200f\u2028-\u202f\u2060-\u2064\ufeff]"), ""),
-]
-
-
-def _validate_safe_content(text: str) -> str:
-    """Catch unknown attack patterns via heuristic:
-    high density of directive/imperative language in a short span.
-    Falls back to [SANITIZED] placeholder if heuristic triggers.
-    """
-    if not text or len(text) < 20:
-        return text
-    try:
-        # Count directive-style phrases per character
-        directivess = len(re.findall(
-            r"(?i)\b(ignore|forget|disregard|override|replace|pretend|act\s+as|you\s+(are|must|will|shall))\b",
-            text
-        ))
-        if directivess >= 3 and directivess / max(len(text), 1) > 0.02:
-            return "[SANITIZED]"
-        return text
-    except Exception:
-        return text
-
-
-def _sanitize_context_text(text: str, max_len: int = 600) -> str:
-    """Sanitize retrieved text before it enters the agent's context.
-    Strips known injection patterns, validates safety, truncates.
-    Fail-open: returns truncated original on error.
-    """
-    if not text:
-        return ""
-    try:
-        result = str(text)
-        for pattern, replacement in _INJECTION_PATTERNS:
-            result = pattern.sub(replacement, result)
-        # Safety heuristic catch
-        result = _validate_safe_content(result)
-        # Normalize excessive whitespace
-        result = re.sub(r"\n{4,}", "\n\n\n", result)
-        result = re.sub(r" {8,}", " ", result)
-        return result.strip()[:max_len]
-    except Exception:
-        return str(text)[:max_len]
+from .sanitize import (
+    INJECTION_PATTERNS as _INJECTION_PATTERNS,
+    validate_safe_content as _validate_safe_content,
+    sanitize_context_text as _sanitize_context_text,
+)
 
 
 def pre_llm_call(session_id="", user_message="", is_first_turn=False, **kwargs):
