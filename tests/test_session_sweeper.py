@@ -954,6 +954,42 @@ def test_a_lock_failure_does_not_stop_other_candidates(hermes_db):
     assert pg.claimed[("s1", last_ids["s1"])] == "published"
 
 
+class WatermarksBoomOnSecondCallPg(FakePg):
+    """The watermark RE-READ is a Postgres round trip too, and fix round 1
+    found it sitting bare between try_session_lock and claim() — a dropped
+    connection there escaped sweep() entirely and ended the whole run,
+    losing every remaining candidate instead of deferring just this one.
+
+    watermarks() is called once before the loop (building `marks`) and once
+    per candidate after locking (the re-read), so the SECOND call overall is
+    the first candidate's re-read — that is the one this raises on, proving
+    the second candidate still runs to completion."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._calls = 0
+
+    def watermarks(self):
+        self._calls += 1
+        if self._calls == 2:
+            raise RuntimeError("db down")
+        return super().watermarks()
+
+
+def test_a_watermark_reread_failure_does_not_stop_other_candidates(hermes_db):
+    now = time.time()
+    sessions, messages, last_ids = two_eligible_sessions(now)
+    pg = WatermarksBoomOnSecondCallPg()
+    deps, written, jobs = make_deps(hermes_db(sessions=sessions, messages=messages), pg)
+    result = sw.sweep(deps, CFG)
+    assert result["candidates"] == 2
+    assert result["locked_out"] == 1
+    assert result["extracted"] == 1
+    # s0's re-read raised before any row was claimed for it.
+    assert ("s0", last_ids["s0"]) not in pg.claimed
+    assert pg.claimed[("s1", last_ids["s1"])] == "published"
+
+
 class StaleAfterLockPg(FakePg):
     """Reproduces the race decision 3 exists for: two sweeps both read
     watermarks() before either locks, so they build slices against the SAME
@@ -984,7 +1020,12 @@ def test_a_slice_built_against_a_stale_watermark_is_dropped_after_locking(hermes
     now = time.time()
     sessions, messages = rich_session(now)
     path = hermes_db(sessions=sessions, messages=messages)
-    pg = StaleAfterLockPg(advance_to=12)
+    # rich_session's slice is first_id=1, last_id=12. advance_to must sit
+    # STRICTLY between the two (not just >= first_id, which 12 also
+    # satisfies) or a regression that compared against last_id instead of
+    # first_id — the exact mistake decision 3 exists to catch — would still
+    # pass this test (fix round 1, Finding 2).
+    pg = StaleAfterLockPg(advance_to=6)
     deps, written, jobs = make_deps(path, pg)
     result = sw.sweep(deps, CFG)
     assert result["extracted"] == 0

@@ -251,7 +251,22 @@ def sweep(deps: Deps, cfg: dict) -> dict:
         # constraint would never catch this: only re-reading after the lock
         # can. `>=` because a moved watermark means this slice's earliest
         # message has already been consumed by the other winner.
-        fresh_marks = deps.pg.watermarks()
+        #
+        # This round trip can fail exactly like its two neighbours above and
+        # below (fix round 1, Finding 1) — it used to sit bare, so a dropped
+        # connection here escaped sweep() entirely and ended the whole run,
+        # losing every remaining candidate instead of deferring just this
+        # one. Counted under `locked_out`: from the run's perspective this
+        # candidate was not safely processable past the lock step either way
+        # (contention or a bad connection), and a third counter for "held the
+        # lock but couldn't confirm freshness" would not tell an operator
+        # anything they would act on differently.
+        try:
+            fresh_marks = deps.pg.watermarks()
+        except Exception as exc:
+            logger.warning("watermark re-read for %s failed: %s", cand.session_id, exc)
+            stats["locked_out"] += 1
+            continue
         if fresh_marks.get(cand.session_id, 0) >= first_id:
             logger.info("slice %s:%s is stale — the watermark moved past it while "
                        "waiting for the lock", cand.session_id, last_id)
