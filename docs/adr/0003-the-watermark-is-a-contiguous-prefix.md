@@ -122,7 +122,15 @@ Everything that was hard becomes mechanical:
 **Within one session, the retry comes first** — a session that owes an answer gives it before it
 takes on more work. ACROSS sessions the two kinds are interleaved, `[retry, fresh, retry, …]`,
 and retries take at most `max_per_run - 1` of a run's budget so at least one fresh slot always
-survives. A strict retry-first ordering was revision 2's rule and it starves: both circuit
+survives — except at `max_per_run = 1`, where the single slot goes to the retry, because with one
+slice per run neither breaker can trip (both need two) and there is nothing to starve.
+
+**`max_per_run` bounds the RUN, not each pass.** The fresh pass is given only what the retries
+left, and the interleaved list is truncated to `max_per_run` on top of that. Adding retries
+alongside a full fresh quota would make a configured budget of three cost five LLM calls, and
+`max_per_run` is not only money: its own comment in the sweeper calls it "how many distinct
+sessions a single run can ever touch", which is what the cross-session breaker's threshold is
+calibrated against. A strict retry-first ordering was revision 2's rule and it starves: both circuit
 breakers end a run with `break`, so two failing retry rows in different sessions abort the run
 before any fresh candidate is reached, every cadence. Interleaving means a fresh slice has
 already been processed by the time the second retry can trip anything.
@@ -194,10 +202,19 @@ counter that only ever increments:
   2026-08-22: at `retries = 40`, `SELECT now() + LEAST(INTERVAL '15 minutes' * POWER(2, 40),
   INTERVAL '24 hours')` fails with `ERROR: interval out of range` — which would raise inside
   `mark_failed` itself, so a slice that had failed forty times could no longer even be recorded
-  as failed. With the inner `LEAST(retries, 7)` the same query returns cleanly for every value
+  as failed — and worse, `_EXPIRE_STALE_SQL` carries the same expression over every stale row in
+  ONE statement, so a single row aged past the overflow point aborts the whole top-of-sweep
+  expiry, which is what makes abandoned rows visible to `find_candidates` at all. One poison row
+  would have stopped every sweep. With the inner `LEAST(retries, 7)` the same query returns cleanly for every value
   tried up to 100. The measured schedule is 15m, 30m, 1h, 2h, 4h, 8h, 16h, then 24h from the
   eighth failure on.
 - `failed_slices` returns only rows where `next_retry_at IS NULL OR next_retry_at <= now()`.
+- **And the same condition goes into `_CLAIM_RECLAIM_SQL`'s `failed` arm**, because
+  `failed_slices` reads before the lock. Another sweeper can claim the row, fail it and push its
+  backoff hours out in that window, leaving `status` back at `'failed'` — which a status-only
+  re-read waves straight through, defeating the backoff and the breaker cooldown it provides.
+  Checked inside the UPDATE, the row is either still due when it is taken or it is not taken.
+  The stale-`claimed` arm keeps no such condition: a `claimed` row has no backoff to respect.
 
 So the first retry is one cadence later, the fifth is four hours later, and everything from the
 eighth on is daily. A row that will never succeed stops costing a sweep; a row waiting out an

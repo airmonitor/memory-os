@@ -177,7 +177,11 @@ Two things about that expression are load-bearing and neither is obvious:
 1. `session_extraction.retries` on the right-hand side is the value BEFORE this statement's
    increment, so the first failure schedules 15 minutes out (`2^0`) and the second 30 (`2^1`).
    Off by one and every row waits double from the start.
-2. **The inner `LEAST(…, 7)` is not redundant with the outer one.** The outer `LEAST` applies to
+2. **The inner `LEAST(…, 7)` is not redundant with the outer one, and the blast radius is
+   larger than one row.** `_EXPIRE_STALE_SQL` carries the same expression over EVERY stale row
+   in one statement, so a single row that has aged past the overflow point aborts the whole
+   top-of-sweep expiry — and `expire_stale_claims` running is what makes abandoned rows visible
+   to `find_candidates` at all. One poison row would stop every sweep. The outer `LEAST` applies to
    the RESULT of the multiplication, so an uncapped exponent overflows the interval type before
    the cap can help. Measured on PostgreSQL 17, 2026-08-22: `POWER(2, 40)` there raises
    `ERROR: interval out of range` — inside `mark_failed`, which means a slice that has failed
@@ -234,7 +238,9 @@ git commit -m "feat(store): a retries counter and a backoff clock for the three 
 - Test: `tests/test_session_store.py`
 
 **Interfaces:**
-- Produces: `failed_slices(conn, limit=50) -> list[dict]` with keys `session_id`, `first_message_id`, `last_message_id`, `attempts`, `retries`; `slice_status(conn, session_id, last_message_id) -> str | None`.
+- Produces: `failed_slices(conn, limit=50) -> list[dict]` with keys `session_id`, `first_message_id`, `last_message_id`, `attempts`, `retries`; `slice_status(conn, session_id, last_message_id) -> str | None`; and **`_PgAdapter` delegates for both**.
+
+**The delegate is not optional bookkeeping — leaving it out disables the feature silently.** `_PgAdapter` in `scripts/session_sweeper.py` has explicit one-line delegates and **no `__getattr__` fallback**, so `deps.pg.failed_slices()` on the real adapter raises `AttributeError` — which Task 4's retry block catches as its fail-open `owed = []`. The result is a sweeper that logs one warning and then never retries anything, while the new frontier keeps the fresh pass from reaching those rows either. Every unit test would still pass, because `FakePg` has the method.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -346,11 +352,35 @@ def slice_status(conn, session_id: str, last_message_id: int) -> str | None:
 Run: `pytest tests/test_integration_postgres.py -v`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Add the two `_PgAdapter` delegates**
+
+In `scripts/session_sweeper.py`, next to the existing ones:
+
+```python
+    def failed_slices(self, **kw):
+        return session_store.failed_slices(self.conn, **kw)
+
+    def slice_status(self, **kw):
+        return session_store.slice_status(self.conn, **kw)
+```
+
+- [ ] **Step 6: Guard the gap that hid this**
+
+Add a test that walks `_PgAdapter` against the methods `sweep()` actually calls, so the next
+missing delegate is caught by the suite rather than by a silent production no-op:
+
+```python
+def test_the_real_adapter_answers_everything_the_sweeper_asks_of_pg():
+    used = {name for name in dir(FakePg) if not name.startswith("_")}
+    missing = used - {n for n in dir(session_sweeper._PgAdapter) if not n.startswith("_")}
+    assert not missing, f"_PgAdapter is missing {missing}; sweep() would fail open and do nothing"
+```
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add scripts/session_store.py tests/test_integration_postgres.py
-git commit -m "feat(store): failed_slices and slice_status, the retry pass's candidate source"
+git add scripts/session_store.py scripts/session_sweeper.py tests/
+git commit -m "feat(store): failed_slices and slice_status, wired through the real adapter"
 ```
 
 ---
@@ -531,8 +561,17 @@ Inside `sweep()`, before the `find_candidates` block:
     # `break` over one list, so two failing retry rows in different sessions
     # abort a sweep before any fresh candidate is reached — every cadence,
     # until an operator notices.
+    # session_id_filter is read HERE, not at its current line 186 — that
+    # assignment sits after find_candidates, so a retry block placed above it
+    # raises UnboundLocalError on the first owed row. Move the assignment up;
+    # do not duplicate it.
+    session_id_filter = cfg.get("session_id")
     retry_slices = []
-    retry_budget = max(1, cfg["max_per_run"] - 1)
+    # At most max_per_run - 1, so a run always has a fresh slot — EXCEPT at
+    # max_per_run == 1, where the single slot goes to the retry: with one slice
+    # per run neither breaker can trip (both need two), so there is nothing to
+    # starve, and an owed answer outranks new work.
+    retry_budget = cfg["max_per_run"] - 1 if cfg["max_per_run"] > 1 else 1
     try:
         owed = deps.pg.failed_slices()
     except Exception as exc:                      # fail-open, same as every other round trip
@@ -554,6 +593,15 @@ Inside `sweep()`, before the `find_candidates` block:
         retry_slices.append((cand, [], messages, row))
 ```
 
+Then give the fresh pass only what the retries left. `find_candidates` is called with
+`limit=cfg["max_per_run"]` today; it must become the remaining budget, or the run makes
+`max_per_run` fresh LLM calls **plus** the retries — five calls at a configured budget of three:
+
+```python
+        fresh_budget = max(0, cfg["max_per_run"] - len(retry_slices))
+        candidates = hermes_state.find_candidates(..., limit=fresh_budget)
+```
+
 Feed both into one loop, INTERLEAVED — retry, fresh, retry, fresh — so a fresh slice has
 already been processed by the time a second retry can trip a breaker:
 
@@ -568,8 +616,13 @@ already been processed by the time a second retry can trip a breaker:
               for x in pair if x is not None]
 ```
 
-and unpack `for cand, context, messages, retry_row in slices:`. Add `import itertools` to the
-stdlib block at the top of the module.
+then `slices = slices[:cfg["max_per_run"]]` as a belt on top of the two budgets above, and
+unpack `for cand, context, messages, retry_row in slices:`. Add `import itertools` to the stdlib
+block at the top of the module.
+
+`max_per_run` is not only an LLM-call budget: its own comment in the sweeper calls it "how many
+distinct sessions a single run can ever touch", which is what the cross-session breaker's
+threshold is calibrated against. Exceeding it changes that calibration silently.
 
 - [ ] **Step 5: Replace the staleness check for retry slices**
 
@@ -592,6 +645,13 @@ With the frontier, a hole's `first_id` is 1 and the frontier is 20, so `20 >= 1`
             # at 50 rows AND filtered by the backoff clock, so on a busy repair
             # a genuinely-owed row falls outside it and gets logged as
             # "resolved by another sweeper" when nobody resolved anything.
+            #
+            # This read is for the LOG LINE and the early skip. It is NOT the
+            # authority on due-ness and must not be: between failed_slices()
+            # and this lock, another sweeper can claim the row, fail it, and
+            # push next_retry_at hours out — leaving status back at 'failed',
+            # which this check would wave through, defeating the backoff. The
+            # authority is the claim SQL itself (step 5b), which is atomic.
             try:
                 still_owed = deps.pg.slice_status(
                     session_id=cand.session_id, last_message_id=last_id) == "failed"
@@ -606,6 +666,49 @@ With the frontier, a hole's `first_id` is 1 and the frontier is 20, so `20 >= 1`
                 continue
         else:
             ... existing watermark re-read, unchanged ...
+```
+
+- [ ] **Step 5b: Make due-ness part of the claim, not a check before it**
+
+`_CLAIM_RECLAIM_SQL`'s `failed` arm gains the backoff condition, so a row whose cooldown was
+renewed between selection and claim simply loses the claim — `won=False`, "already claimed",
+skip — instead of being reclaimed immediately:
+
+```sql
+    ON CONFLICT (session_id, last_message_id) DO UPDATE
+        SET status = 'claimed', claimed_at = now(), updated_at = now()
+        WHERE (session_extraction.status = 'failed'
+               -- Due-ness belongs HERE and not only in failed_slices(): that
+               -- read happens before the lock, and another sweeper can fail
+               -- the row and push its backoff out in between. Checked in the
+               -- UPDATE, the row either is still due when we take it or we do
+               -- not take it (ADR-0003 decision 3).
+               AND (session_extraction.next_retry_at IS NULL
+                    OR session_extraction.next_retry_at <= now()))
+           OR (session_extraction.status = 'claimed'
+               AND session_extraction.updated_at
+                   < now() - make_interval(hours => %s))
+    RETURNING id
+```
+
+The stale-`claimed` arm is deliberately left alone: a `claimed` row has no backoff to respect.
+
+Integration test for the race:
+
+```python
+def test_a_row_rescheduled_between_selection_and_claim_is_not_reclaimed(conn):
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    session_store.mark_failed(conn, session_id="s", last_message_id=10, error="x")
+    _make_due(conn, "s", 10)
+    owed = session_store.failed_slices(conn)            # selected while due
+    assert owed
+    session_store.claim(conn, session_id="s", first_message_id=1,       # another sweeper
+                        last_message_id=10, message_count=10)
+    session_store.mark_failed(conn, session_id="s", last_message_id=10, error="x")
+    assert session_store.slice_status(conn, "s", 10) == "failed"        # status says go
+    assert session_store.claim(conn, session_id="s", first_message_id=1,
+                               last_message_id=10, message_count=10) is False
 ```
 
 - [ ] **Step 6: Count it**
