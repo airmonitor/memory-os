@@ -22,6 +22,12 @@ Before wiring it up, see what a run would do without writing anything:
 $VENV_DIR/bin/python $PROJECT_DIR/scripts/session_sweeper.py --dry-run --verbose
 ```
 
+## Deployment Order
+
+**The worker image must be updated before, or in the same change, as the sweeper — never after.** Since ADR-0002 decision 2, the sweeper calls `deps.enqueue("process_ingestion", ..., point_id=point_id(job_id))`, passing a keyword argument that only exists on the current `docker/worker/main.py::process_ingestion(ctx, memory_text, source, tags=None, point_id=None)`. An OLDER worker image — deployed before that parameter was added — has a `process_ingestion` with no `point_id` parameter at all, so ARQ calling that job raises `TypeError: process_ingestion() got an unexpected keyword argument 'point_id'` inside the worker on every attempt (ARQ's own retry policy does not help — the signature mismatch is identical on every retry). The sweeper never learns about it either way: `mark_published` is called right after enqueuing, in the same code path regardless of whether the job later succeeds in the worker. The fabric entry is on disk, `session_extraction.status` is `'published'`, and nothing in `sweeper_status` or `session_extraction.error` ever records that the worker rejected the job — the memory is lost silently, not retried by anything this repo's own bookkeeping would notice.
+
+Rolling the worker out first (or atomically with the sweeper) is what avoids this: the current worker's `point_id` parameter defaults to `None` and falls through to `ingest_memory`'s existing `uuid4()` fallback, so it accepts jobs from an OLDER sweeper too. The upgrade is one-directional-safe only in the worker-first order.
+
 ## Monitoring
 
 The sweeper records every run (success or failure) in the PostgreSQL `sweeper_status` table. To inspect the five most recent runs:
@@ -52,6 +58,30 @@ A failed slice is excluded from the watermark, so it is offered again on the nex
 
 An extraction that could not reach the model — a timing-out proxy, a missing API key, output that is not JSON — raises rather than returning "no entries", precisely so it shows up here instead of quietly advancing the watermark past an unread conversation.
 
+## Attempts and Quarantine
+
+`session_extraction.attempts` (ADR-0002 decision 4) counts only **classified-deterministic** failures — the gateway answered like a gateway, but the *model's* output did not parse or validate. A transient failure (connection error, timeout, an HTTP status error, a missing key, or a body that is not a chat completion) never moves it: an outage spanning several sweeps must not spend a slice's three tries just because the gateway was down. Reclaiming a stale `'claimed'` row (a crash between claim and extraction) does not touch it either, for the same reason.
+
+```sql
+SELECT session_id, last_message_id, attempts, status, error, updated_at
+  FROM session_extraction WHERE attempts > 0 ORDER BY updated_at DESC LIMIT 10;
+```
+
+At `SESSION_MAX_ATTEMPTS` (default 3) a slice that keeps failing deterministically becomes `quarantined` instead of sitting at `'failed'` forever, burning an LLM call every 15 minutes for a conversation that will never parse. `quarantined` still counts toward the watermark — `watermarks()` excludes only `'failed'` — so it does not block that session's later messages behind a slice that is never coming back on its own. Nothing alerts on this yet, so it has to be watched for:
+
+```sql
+SELECT ran_at, quarantined FROM sweeper_status WHERE quarantined > 0 ORDER BY ran_at DESC LIMIT 5;
+```
+
+**The one-statement replay** that un-retires a quarantined slice and gives it a fresh set of attempts (for example, after a prompt or model fix that would now handle it):
+
+```sql
+UPDATE session_extraction SET status = 'failed', attempts = 0
+  WHERE session_id = 'example-session-id' AND last_message_id = 12345;
+```
+
+No code change and no `ensure_schema` involved — `claim()`'s existing `'failed'`-reclaim arm picks the row up on the very next sweep.
+
 ## Re-extracting a Session
 
 To re-extract a specific session (for example, if a model update improved extraction quality):
@@ -61,6 +91,23 @@ DELETE FROM session_extraction WHERE session_id = 'example-session-id';
 ```
 
 On the next sweep, the session will be offered again if it is still a candidate (quiet for `idle_minutes`, or ended). Fabric filenames are deterministic per `(session_id, last_message_id, index)`, so the re-run overwrites the old entries rather than adding a second copy of each.
+
+### Reconciling Qdrant Points After a Re-extraction
+
+Since ADR-0002 decision 2, the sweeper's Qdrant point id is `uuid5(NAMESPACE_URL, job_id)` (`scripts.session_sweeper.point_id`), where `job_id` is `ingest:{session_id}:{last_message_id}:{index}` (`scripts.session_sweeper.job_id`) — the same string every time for the same slice and entry index. **If a re-extraction reproduces the same `(session_id, last_message_id)` slice with the same number of entries, nothing needs reconciling**: every entry gets the same `job_id`, therefore the same point id, and the worker's `qdrant.upsert` overwrites the old point's payload in place.
+
+Reconciliation is only a real step in two cases, and the honest limit has to be stated: **the Qdrant payload the worker writes (`docker/worker/tasks/ingestion.py::ingest_memory`) carries no `session_id` field at all** — `payload["source"]` is the literal constant `"session"` for every point the sweeper produces, not the originating session. So there is no payload filter that selects "every point from session X"; the only handle is the point's own id, and only when you still know the `job_id`s that produced it.
+
+- **Same session, fewer entries than before** (the re-extraction is genuinely smaller). The dropped entries' old `job_id`s do not recur, so their points are not overwritten and are left orphaned. Before deleting the `session_extraction` row(s) to trigger the re-extraction, read the old `jobs` column (it holds exactly the `job_id` list `mark_published` recorded) and compute the now-orphaned ids yourself:
+
+  ```python
+  from scripts.session_sweeper import point_id
+  orphaned_ids = [point_id(j) for j in old_job_ids_no_longer_produced]
+  await qdrant.delete(collection_name="knowledge_base",
+                       points_selector=PointIdsList(points=orphaned_ids))
+  ```
+
+- **Legacy points ingested before ADR-0002 decision 2 shipped**, which carry a random `uuid4` id with no relationship to any `job_id`. These cannot be found or deleted by id or by payload filter — there is nothing in the point to compute back from. As of this ADR the production corpus has `points_count: 0`, so there is nothing to reconcile yet; if that changes before a session is re-extracted, the only options are locating the old point by manually reviewing `payload["text"]` against the fabric files it was written from, or accepting the duplicate.
 
 ## Suppressing a Session
 
@@ -72,6 +119,20 @@ UPDATE session_extraction SET status = 'published'
 ```
 
 This works because `watermarks()` counts every status **except** `failed`. Marking the row `published` is therefore what puts the session *into* the watermark: `find_candidates` then sees no messages past that watermark and stops offering the slice. (A row left at `failed` does the opposite — it drops out of the watermark and the slice comes back.) To suppress a session that has no row yet, insert one with the session's current `max(messages.id)` as `last_message_id`.
+
+## Integration Tests
+
+`tests/test_session_store.py` and `tests/test_session_lock.py` check the SQL `scripts/session_store.py` *builds*, against a `FakeConn`/`FakeCursor` pair that only proves the code sent the statement it intended to send — it agrees with whatever the code does, so it cannot check that PostgreSQL accepts `ON CONFLICT ... DO UPDATE ... WHERE`, evaluates `make_interval`/`GREATEST` the way the docstrings claim, round-trips the JSONB payload, upgrades an existing table with `ADD COLUMN IF NOT EXISTS`, or that `pg_try_advisory_xact_lock` is really released by the transaction rather than the connection. `tests/test_integration_postgres.py` runs those same code paths against a real server instead.
+
+It is skipped by default — collected but immediately skipped unless `MEMOS_TEST_DSN` is set — so a plain `.venv/bin/pytest` run stays offline with no host and no credential. To run it:
+
+```bash
+docker run -d --rm --name memos-test-pg -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:17
+MEMOS_TEST_DSN=postgresql://postgres:test@localhost:55432/postgres .venv/bin/pytest tests/test_integration_postgres.py -v
+docker rm -f memos-test-pg
+```
+
+Or select just this file by marker: `.venv/bin/pytest -m integration` (still needs `MEMOS_TEST_DSN`, or every test in it skips). Each test claims a randomly-suffixed `session_id`, and the `conn` fixture drops both tables on teardown — the file is safe to run twice against the same database, and safe to point at a shared test database another session is also using.
 
 ## Acceptance Criteria
 

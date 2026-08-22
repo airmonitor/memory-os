@@ -105,9 +105,25 @@ reflection path builds its own `PointStruct`. Neither would have gained anything
 
 **Legacy points are not migrated, and this ADR does not pretend otherwise.** Points already
 stored under a `uuid4` id stay; a replay after this change writes a *new* deterministic point
-beside the old one. Reconciliation is a delete by payload filter on `session_id`, documented in
-the operator page rather than automated, because the only corpus that exists today has
-`points_count: 0`.
+beside the old one. Reconciliation is documented in the operator page rather than automated,
+because the only corpus that exists today has `points_count: 0` — and that page also records a
+narrower limit this ADR did not: the Qdrant payload carries no `session_id` field at all
+(`payload["source"]` is the constant `"session"` for every point the sweeper produces), so a
+payload filter on session id is not actually available; reconciling a partial re-extraction
+needs the old `job_id`s (read from `session_extraction.jobs` before the row is deleted) to
+recompute the now-orphaned point ids, and legacy `uuid4`-id points cannot be recovered by any
+filter at all.
+
+**This decision carries a deployment-order requirement the rest of the ADR does not state
+elsewhere: the worker image must be updated before, or atomically with, the sweeper — never
+after.** The sweeper enqueues `process_ingestion` with an explicit `point_id` kwarg the moment
+this decision ships. An OLDER worker's `process_ingestion` has no `point_id` parameter at all,
+so that job raises `TypeError` inside the worker — and the sweeper has already called
+`mark_published` and written the fabric file by the time that happens, so nothing re-offers the
+slice and nothing surfaces the failure in `sweeper_status` or `session_extraction.error`. The
+memory is lost silently, not retried. Deploying the worker first is safe in the other direction
+because the current worker's `point_id` parameter defaults to `None` and falls through to the
+pre-existing `uuid4()` behaviour, so it also accepts jobs from an older sweeper.
 
 ### 3. One sweeper per session, released by the transaction (#3)
 
