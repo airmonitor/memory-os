@@ -8,6 +8,7 @@ Decisions that shape MemoryOS and the icarus plugin, with the measurements behin
 | --- | --- | --- | --- |
 | [0001](0001-session-extraction-via-state-db-sweeper.md) | Extract sessions by sweeping Hermes' `state.db`, not from the plugin hook | Proposed | 2026-08-22 |
 | [0002](0002-hardening-the-session-sweeper.md) | Hardening the session sweeper — sanitisation, idempotent ingestion, single-writer, and a failure ceiling | Proposed | 2026-08-22 |
+| [0003](0003-the-watermark-is-a-contiguous-prefix.md) | The watermark is a contiguous prefix, and the ceiling is keyed to where a slice starts | Proposed | 2026-08-22 |
 
 ## Creating a new ADR
 
