@@ -183,9 +183,20 @@ counter that only ever increments:
 - `retries INTEGER NOT NULL DEFAULT 0` — incremented on **every** transition into `failed`,
   regardless of classification. No ceiling. It is the backoff exponent and the number an
   operator reads.
-- `next_retry_at` — `now() + LEAST(INTERVAL '15 minutes' * POWER(2, retries - 1),
-  INTERVAL '24 hours')`. NULL means due now, which is what every pre-existing row already is,
-  so the migration needs no backfill.
+- `next_retry_at` — `now() + LEAST(INTERVAL '15 minutes' * POWER(2, LEAST(retries, 7)),
+  INTERVAL '24 hours')`, where `retries` is the value BEFORE this statement's increment. NULL
+  means due now, which is what every pre-existing row already is, so the migration needs no
+  backfill.
+
+  **The exponent has to be capped, and not because 24 hours is the answer twice.** `LEAST` is
+  evaluated on the RESULT of the multiplication, so an uncapped `POWER(2, retries)` overflows the
+  interval type before the cap can apply. Measured against the reference host's PostgreSQL 17 on
+  2026-08-22: at `retries = 40`, `SELECT now() + LEAST(INTERVAL '15 minutes' * POWER(2, 40),
+  INTERVAL '24 hours')` fails with `ERROR: interval out of range` — which would raise inside
+  `mark_failed` itself, so a slice that had failed forty times could no longer even be recorded
+  as failed. With the inner `LEAST(retries, 7)` the same query returns cleanly for every value
+  tried up to 100. The measured schedule is 15m, 30m, 1h, 2h, 4h, 8h, 16h, then 24h from the
+  eighth failure on.
 - `failed_slices` returns only rows where `next_retry_at IS NULL OR next_retry_at <= now()`.
 
 So the first retry is one cadence later, the fifth is four hours later, and everything from the

@@ -66,10 +66,14 @@ def test_each_failure_pushes_next_retry_at_further_out(conn):
     assert (second - first).total_seconds() > 12 * 60
 
 
-def test_the_backoff_is_capped_at_a_day(conn):
+def test_the_backoff_survives_a_row_that_failed_forty_times(conn):
+    """Not just 'is it capped'. LEAST applies to the RESULT of the
+    multiplication, so an uncapped POWER(2, retries) raises 'interval out of
+    range' INSIDE mark_failed — measured at retries=40 on PostgreSQL 17. A row
+    that has failed forty times would stop being recordable as failed."""
     session_store.claim(conn, session_id="s", first_message_id=1,
                         last_message_id=10, message_count=10)
-    for _ in range(30):
+    for _ in range(40):
         session_store.mark_failed(conn, session_id="s", last_message_id=10, error="x")
     with conn.cursor() as cur:
         cur.execute("SELECT next_retry_at - now() < interval '25 hours' "
@@ -79,7 +83,7 @@ def test_the_backoff_is_capped_at_a_day(conn):
 
 - [ ] **Step 2: Run it to see it fail**
 
-Run: `pytest tests/test_integration_postgres.py -k "retries_counts or next_retry_at or capped_at_a_day" -v`
+Run: `pytest tests/test_integration_postgres.py -k "retries_counts or next_retry_at or failed_forty_times" -v`
 Expected: FAIL — `mark_failed` returns an int, and neither column exists.
 
 - [ ] **Step 3: Add the columns**
@@ -162,13 +166,23 @@ and its SQL gains, in the `SET` list:
 ```sql
        retries = session_extraction.retries + 1,
        next_retry_at = now() + LEAST(
-           INTERVAL '15 minutes' * POWER(2, session_extraction.retries),
+           INTERVAL '15 minutes' * POWER(2, LEAST(session_extraction.retries, 7)),
            INTERVAL '24 hours')
 ```
 
-plus `RETURNING attempts, retries`. `session_extraction.retries` on the right-hand side is the
-value BEFORE this statement's increment, so the first failure schedules 15 minutes out
-(`2^0`), the second 30 (`2^1`). Getting that off by one gives every row a doubled first wait.
+plus `RETURNING attempts, retries`.
+
+Two things about that expression are load-bearing and neither is obvious:
+
+1. `session_extraction.retries` on the right-hand side is the value BEFORE this statement's
+   increment, so the first failure schedules 15 minutes out (`2^0`) and the second 30 (`2^1`).
+   Off by one and every row waits double from the start.
+2. **The inner `LEAST(…, 7)` is not redundant with the outer one.** The outer `LEAST` applies to
+   the RESULT of the multiplication, so an uncapped exponent overflows the interval type before
+   the cap can help. Measured on PostgreSQL 17, 2026-08-22: `POWER(2, 40)` there raises
+   `ERROR: interval out of range` — inside `mark_failed`, which means a slice that has failed
+   forty times can no longer be recorded as failed at all. Verified schedule with the inner cap:
+   `15m, 30m, 1h, 2h, 4h, 8h, 16h, 24h, 24h, 24h` for `retries = 0..9`.
 
 `_EXPIRE_STALE_SQL` gets the identical two clauses. It is BULK SQL over every stale row at
 once, which is exactly why the backoff is computed in the UPDATE and not in Python — there is no
@@ -183,7 +197,7 @@ per-row Python pass here to compute it in:
        -- evidence about the conversation.
        retries = session_extraction.retries + 1,
        next_retry_at = now() + LEAST(
-           INTERVAL '15 minutes' * POWER(2, session_extraction.retries),
+           INTERVAL '15 minutes' * POWER(2, LEAST(session_extraction.retries, 7)),
            INTERVAL '24 hours'),
 ```
 
