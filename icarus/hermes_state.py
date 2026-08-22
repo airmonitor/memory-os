@@ -131,6 +131,42 @@ def read_slice(con, session_id: str, *, after_id: int) -> list[Message]:
     return _rows_to_messages(rows)
 
 
+def read_slice_range(con, session_id: str, *, first_id: int, last_id: int) -> list[Message]:
+    """The messages a claimed row covers, both ends inclusive.
+
+    `read_slice` (above) asks "what is unconsumed" and is unbounded above by
+    design. This asks a different question — "what did this row claim" — and
+    that difference is the whole of ADR-0003: a failed slice is RETRIED, not
+    re-derived, so the range comes from the row rather than from the watermark.
+
+    An empty return is meaningful, not an error. It means every message in the
+    range went inactive or was rewritten by compaction since the claim, and the
+    caller must retire the row rather than retry it — there is nothing left to
+    extract and no number of retries changes that.
+    """
+    rows = con.execute(
+        f"""SELECT id, role, content, tool_calls, tool_name, timestamp, compacted
+            FROM messages
+            WHERE session_id = ? AND id >= ? AND id <= ? AND COALESCE(active, 1) <> 0
+              AND role IN ({','.join('?' * len(TRANSCRIPT_ROLES))})
+            ORDER BY id ASC""",
+        (session_id, first_id, last_id, *TRANSCRIPT_ROLES),
+    ).fetchall()
+    return _rows_to_messages(rows)
+
+
+def session_source(con, session_id: str) -> str:
+    """The `source` column a Candidate would have carried.
+
+    A retry slice does not come from find_candidates, so it has no Candidate —
+    but the sweeper reads `cand.source` for one thing only, the `platform`
+    field on every fabric entry it writes. Empty string when the session row is
+    gone; the sweeper's existing `or "cli"` fallback covers it.
+    """
+    row = con.execute("SELECT source FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    return (row["source"] or "") if row else ""
+
+
 def context_tail(con, session_id: str, *, before_id: int, limit: int) -> list[Message]:
     if limit <= 0:
         return []

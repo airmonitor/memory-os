@@ -87,3 +87,36 @@ def test_connection_is_read_only(hermes_db):
     con = hs.connect_ro(hermes_db(sessions=[SESSION("s")]))
     with pytest.raises(Exception):
         con.execute("DELETE FROM sessions")
+
+
+def test_read_slice_range_is_inclusive_at_both_ends(hermes_db):
+    # Ids run 1..7 and the range asked for is 3..5, so both bounds have
+    # something to exclude. A db holding only 3..5 would let a completely
+    # unbounded query pass this.
+    path = hermes_db(sessions=[SESSION("s", message_count=7)],
+                     messages=[MSG(i, "s", "user", "x" * 60) for i in range(1, 8)])
+    state_db = hs.connect_ro(path)
+    msgs = hs.read_slice_range(state_db, "s", first_id=3, last_id=5)
+    assert [m.id for m in msgs] == [3, 4, 5]
+
+
+def test_read_slice_range_is_empty_when_every_message_went_inactive(hermes_db):
+    # `active = 0` is set when the db is BUILT, not by an UPDATE: connect_ro
+    # opens the file `mode=ro` and would refuse the write. Same end state —
+    # every message in 3..5 gone, the ones outside it still there.
+    path = hermes_db(
+        sessions=[SESSION("s", message_count=7)],
+        messages=[MSG(i, "s", "user", "x" * 60, active=0 if 3 <= i <= 5 else 1)
+                  for i in range(1, 8)])
+    state_db = hs.connect_ro(path)
+    assert hs.read_slice_range(state_db, "s", first_id=3, last_id=5) == []
+
+
+def test_session_source_is_empty_when_the_session_row_is_gone(hermes_db):
+    """The sweeper's `or "cli"` fallback is what covers it — a retry slice has
+    no Candidate to read `source` from, only this."""
+    path = hermes_db(sessions=[SESSION("s", source="slack", message_count=1)],
+                     messages=[MSG(1, "s", "user", "x" * 60)])
+    state_db = hs.connect_ro(path)
+    assert hs.session_source(state_db, "s") == "slack"
+    assert hs.session_source(state_db, "vanished") == ""
