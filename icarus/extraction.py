@@ -67,8 +67,9 @@ _MIN_SUMMARY_LEN = 10
 _MIN_CONTENT_LEN = 60
 _SUMMARY_MAX, _CONTENT_MAX = 80, 2000
 
-# Verbatim copy of the prompt from hooks.py:_llm_extract_entries — the move to
-# this module must not change extraction behaviour.
+# Verbatim copy of the prompt from hooks.py:_llm_extract_entries, plus the
+# ADR-0002 decision-1 trust-boundary paragraph appended in Task 2 (sweeper
+# hardening) — everything above that paragraph must still match hooks.py.
 EXTRACTION_PROMPT = (
     "You are a session archivist for an AI agent. Analyze this agent session "
     "transcript and extract ONLY significant entries worth preserving in a "
@@ -120,7 +121,7 @@ def _render(message) -> str | None:
     if message.role == "assistant":
         if content:
             return _wrap("assistant", content[:ASSISTANT_MAX])
-        names = _tool_names(message.tool_calls)
+        names = [_escape_delimiter(n) for n in _tool_names(message.tool_calls)]
         return _wrap("assistant", f"[tool: {', '.join(names)}]") if names else None
     if message.role == "tool":
         if not content:
