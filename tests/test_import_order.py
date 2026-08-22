@@ -2,7 +2,15 @@ import ast
 import pathlib
 import pytest
 
-SCRIPTS = sorted(pathlib.Path("scripts").glob("*.py"))
+# Resolved from THIS FILE, never from the working directory. `Path("scripts")`
+# is relative to wherever pytest was invoked, so running the suite from
+# anywhere but the repo root collected ZERO cases here — the parametrisation
+# emptied out, and a permanent regression gate for the incident that cost
+# memoryos-reflection-trigger 32 runs vanished with no failure and no skip.
+# An empty parametrize list is silent by construction; that is the whole
+# reason this is anchored.
+_REPO = pathlib.Path(__file__).resolve().parent.parent
+SCRIPTS = sorted((_REPO / "scripts").glob("*.py"))
 VENDORED = {"psycopg", "qdrant_client", "arq", "redis"}
 
 # Anything imported inside one of these never runs at module-import time, so
@@ -82,6 +90,20 @@ def test_memos_config_is_imported_before_anything_vendored(path):
     assert failures == []
 
 
+def test_the_rule_collected_something_to_check():
+    """The gate above is a parametrisation, and an EMPTY parametrisation
+    passes in silence — no failure, no skip, no case ids. That is exactly how
+    it disappeared: `SCRIPTS` globbed a path relative to the working
+    directory, so `pytest` run from anywhere but the repo root checked nothing
+    at all while reporting green. Anchoring `SCRIPTS` to `__file__` is the
+    fix; this test is what makes a future un-anchoring (or a moved/renamed
+    `scripts/`) fail loudly instead of evaporating.
+    """
+    assert SCRIPTS, "no scripts/*.py collected — the import-order gate is not running"
+    names = {p.name for p in SCRIPTS}
+    assert {"session_sweeper.py", "session_store.py", "db.py"} <= names
+
+
 def test_a_deferred_vendored_import_does_not_fail_the_rule(tmp_path):
     """Positive case for the module-level scoping above, on a throwaway
     fixture rather than whichever real script happens to have this shape
@@ -113,8 +135,8 @@ def test_the_lineage_hash_width_agrees_across_writers():
     assertion that got its expectation through the same truncating lookup as
     the code under test, and passed while the files it compared differed).
     """
-    hooks_tree = ast.parse(pathlib.Path("icarus/hooks.py").read_text())
-    enhancer = pathlib.Path("scripts/context_enhancer.py").read_text()
+    hooks_tree = ast.parse((_REPO / "icarus" / "hooks.py").read_text())
+    enhancer = (_REPO / "scripts" / "context_enhancer.py").read_text()
 
     hash_kw = None
     for node in ast.walk(hooks_tree):

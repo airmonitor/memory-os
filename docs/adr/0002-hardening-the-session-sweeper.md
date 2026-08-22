@@ -210,8 +210,21 @@ operator page documents the one-statement replay (`UPDATE … SET status='failed
 
 - `icarus/sanitize.py` must import nothing from `icarus.hooks` or `icarus.state` — it is a
   leaf, the way `extraction.py` is.
-- The advisory lock key is a fixed 64-bit constant, written as a named module constant.
-- The integration tests create and drop their own tables inside a transaction that rolls back.
+- The advisory lock key is **per session**, computed by PostgreSQL as
+  `hashtextextended(%s, 0)` with the session id bound as a parameter, never interpolated —
+  and taken with `pg_try_advisory_xact_lock`, so the transaction releases it. Not a fixed
+  64-bit module constant: that is the global lock decision 3 and the adversarial review
+  rejected, and this Note said otherwise until 2026-08-22, when it was corrected. A reader
+  following the old text would have reintroduced exactly what was rejected. The lock alone
+  guarantees nothing either — the caller MUST re-read that session's watermark after winning
+  it (see `session_store.try_session_lock` and the per-slice loop in `sweep()`).
+- The integration tests build their own tables with `ensure_schema` and **drop them and
+  commit** on teardown — they do not roll back, and this Note claimed they did until
+  2026-08-22. The consequence is a restriction, not a detail: the file is safe to re-run in
+  sequence against the same database, and unsafe to run concurrently or against any database
+  something else uses, because a teardown's `DROP TABLE` removes that database's own
+  `session_extraction`/`sweeper_status` bookkeeping. Point `MEMOS_TEST_DSN` at a throwaway
+  container, one run at a time (`docs/session-sweeper.md` §Integration Tests).
 - `SESSION_MAX_ATTEMPTS` is a `${VAR:default}` config key like every other tunable.
 
 ## Related
