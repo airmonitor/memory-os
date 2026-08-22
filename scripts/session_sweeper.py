@@ -630,12 +630,24 @@ def main(argv=None) -> dict:
         # through deps.pg (not scripts.session_store directly against
         # pg_conn), so --dry-run's stubbing of deps.pg.record_run actually
         # covers this call instead of being bypassed by a second write path.
+        #
+        # EVERY KEY sweep() COMPUTES IS PASSED, and the three at the end are
+        # the ones this used to drop. A run that ends on the cross-session
+        # breaker returns normally (sweep() breaks out of the loop and returns
+        # its stats), so `error` is NULL, and the breaker zeroes `quarantined`
+        # because it refunded every attempt — leaving `candidates=2,
+        # extracted=0, quarantined=0, error=NULL`, the shape of a quiet
+        # healthy run, for a gateway that is failing every slice it touches.
+        # `aborted`/`locked_out`/`stale_slices` are what make that queryable
+        # (fix wave 2026-08-22; see session_store.record_run).
         r = result or {}
         try:
             deps.pg.record_run(
                 candidates=r.get("candidates", 0), extracted=r.get("extracted", 0),
                 entries=r.get("entries", 0), jobs=r.get("jobs", 0),
                 redispatched=r.get("redispatched", 0), quarantined=r.get("quarantined", 0),
+                aborted=r.get("aborted", False), locked_out=r.get("locked_out", 0),
+                stale_slices=r.get("stale_slices", 0),
                 schema_version=hermes_state.schema_version(sqlite_conn), error=error)
         except Exception:
             logger.exception("failed to record sweeper_status row")

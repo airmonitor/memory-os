@@ -141,7 +141,8 @@ def test_ensure_schema_is_idempotent_against_a_live_server(conn):
         cur.execute("SELECT column_name FROM information_schema.columns "
                     "WHERE table_name = 'sweeper_status'")
         cols = {r[0] for r in cur.fetchall()}
-    assert {"redispatched", "quarantined"} <= cols
+    assert {"redispatched", "quarantined", "aborted", "locked_out",
+            "stale_slices"} <= cols
 
 
 def test_ensure_schema_upgrades_an_existing_table_missing_the_new_columns(conn):
@@ -197,7 +198,47 @@ def test_ensure_schema_upgrades_an_existing_table_missing_the_new_columns(conn):
                     "WHERE table_name = 'sweeper_status'")
         ss_cols = {r[0] for r in cur.fetchall()}
     assert "attempts" in se_cols
-    assert {"redispatched", "quarantined"} <= ss_cols
+    # The circuit-breaker columns are on this list for the same reason as the
+    # rest: they arrive by ALTER, never by the CREATE above, so a deployment
+    # whose sweeper_status predates them upgrades or the run-level breakers
+    # keep leaving no durable trace at all.
+    assert {"redispatched", "quarantined", "aborted", "locked_out",
+            "stale_slices"} <= ss_cols
+
+
+def test_record_run_stores_the_circuit_breaker_outcome(conn):
+    """The scenario the cross-session breaker exists for, as a row.
+
+    A misrouting gateway fails two sessions deterministically in one run;
+    `sweep()` rolls both attempts back and therefore ZEROES `quarantined`, and
+    it returns normally, so `error` is NULL. Before these columns the row read
+    `candidates=2, extracted=0, quarantined=0, error=NULL` — the shape of a
+    quiet healthy run — while the sweep burned two LLM calls every 15 minutes.
+    `aborted` is the only durable evidence, and this asserts it survives a
+    round trip through a real server (the BOOLEAN column, the widened INSERT,
+    and the argument list `main()` now passes).
+    """
+    from scripts import session_store
+    session_store.record_run(conn, candidates=2, extracted=0, entries=0, jobs=0,
+                             schema_version=26, error=None, redispatched=0,
+                             quarantined=0, aborted=True, locked_out=3, stale_slices=1)
+    with conn.cursor() as cur:
+        cur.execute("SELECT aborted, locked_out, stale_slices, quarantined, error "
+                    "FROM sweeper_status ORDER BY id DESC LIMIT 1")
+        assert cur.fetchone() == (True, 3, 1, 0, None)
+
+
+def test_record_run_defaults_the_new_columns_for_a_healthy_run(conn):
+    """Callers that predate the new keywords must still write a row — the
+    defaults are load-bearing, not tidy, because this call site's whole job is
+    to never raise."""
+    from scripts import session_store
+    session_store.record_run(conn, candidates=1, extracted=1, entries=2, jobs=2,
+                             schema_version=26, error=None)
+    with conn.cursor() as cur:
+        cur.execute("SELECT aborted, locked_out, stale_slices "
+                    "FROM sweeper_status ORDER BY id DESC LIMIT 1")
+        assert cur.fetchone() == (False, 0, 0)
 
 
 def test_mark_failed_returns_the_incremented_attempts_count(conn):

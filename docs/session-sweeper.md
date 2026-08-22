@@ -33,7 +33,8 @@ Rolling the worker out first (or atomically with the sweeper) is what avoids thi
 The sweeper records every run (success or failure) in the PostgreSQL `sweeper_status` table. To inspect the five most recent runs:
 
 ```sql
-SELECT ran_at, candidates, extracted, entries, jobs, redispatched, schema_version, error
+SELECT ran_at, candidates, extracted, entries, jobs, redispatched, quarantined,
+       aborted, locked_out, stale_slices, schema_version, error
   FROM sweeper_status ORDER BY ran_at DESC LIMIT 5;
 ```
 
@@ -44,8 +45,21 @@ Columns:
 - `entries`: Fabric entries written to disk by this run's fresh extractions (re-dispatched slices are counted by `redispatched`, not here)
 - `jobs`: ARQ jobs enqueued by this run's fresh extractions
 - `redispatched`: Slices left `extracted` by an earlier run and finished on this one. A number that never falls to zero means the broker is not accepting jobs (or a fabric write keeps failing) — the backlog is stalled
+- `quarantined`: Slices retired on this run at the deterministic-failure ceiling (see "Attempts and Quarantine"). **Reads 0 on an aborted run, on purpose** — the cross-session breaker refunds every attempt it counted, so nothing was retired; `aborted` is the column to look at there
+- `aborted`: `true` when a run-level circuit breaker ended the sweep early (ADR-0002 decision 4): either `transient_abort` consecutive transient failures, or deterministic failures spanning `deterministic_sessions_abort` distinct sessions. **This is the fail-loud signal for a misrouting gateway**, and nothing else in the row shows it: the run did not crash (it defended itself), so `error` is NULL, and `quarantined` was deliberately zeroed by the rollback. A repeating `aborted = true` with `extracted = 0` means every sweep is paying for LLM calls and storing nothing
+- `locked_out`: Candidates skipped at the advisory lock. **One counter, two causes**: another sweeper held this session's `pg_try_advisory_xact_lock`, or this run held it but the watermark re-read round trip failed. Both mean the slice was not safely processable past the lock step and is offered again next sweep, so the distinction would not change what an operator does. Persistently non-zero on a single-host deployment points at a `flock` that is not doing its job, or at a database connection that keeps dropping
+- `stale_slices`: Candidates dropped after the lock because the watermark had moved past them — another sweeper published the same messages first. Non-zero is the concurrency guard working, not a fault; persistently non-zero means two sweepers are genuinely racing
 - `schema_version`: Hermes `state.db` schema version observed on this run. It is compared against `icarus.hermes_state.KNOWN_SCHEMA_VERSION`, and a mismatch logs one `SCHEMA-DRIFT` warning per run carrying both numbers. Drift never stops a sweep
 - `error`: NULL on success; the error if the **whole run** crashed. A single slice failing does not land here — it lands in `session_extraction.error`, below
+
+A run that a circuit breaker ended is the one failure this table would otherwise hide, so query it directly rather than scanning the columns above:
+
+```sql
+SELECT ran_at, candidates, extracted, quarantined, locked_out, stale_slices
+  FROM sweeper_status WHERE aborted ORDER BY ran_at DESC LIMIT 10;
+```
+
+Rows here with `extracted = 0` are the systemic case: two or more sessions failed deterministically in the same run, which is what a gateway answering HTTP 200 with an unusable body looks like from the outside. Check the gateway before touching any slice — the slices are almost certainly fine, and `session_extraction.attempts` was rolled back precisely so they are not blamed for it.
 
 Per-slice failures are the more common case, and they are deliberately loud:
 

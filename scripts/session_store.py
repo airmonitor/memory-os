@@ -9,19 +9,32 @@ A crash anywhere leaves the slice re-runnable and non-duplicating: the claim
 stops a second extraction, and the deterministic filename makes republication
 an overwrite.
 
-The third leg is weaker than it used to be written. arq refuses a duplicate
-`_job_id` only while that job's result key still exists, and `keep_result` is
-3600 s in `config/services.yaml` — so a re-dispatch is a no-op for one hour
-after the first delivery, not forever. A replay later than that enqueues again,
-and because `ingest_memory` assigns a fresh `uuid.uuid4()` per point, the
-second run writes a DUPLICATE Qdrant point rather than overwriting the first.
-What is guaranteed: no second fabric file, no double ingestion inside the
-result-retention window, and no second LLM call once `mark_extracted` has
-banked the payload — a crash in the window between the model answering and that
-commit leaves the row at 'claimed', and the reclaim correctly pays for the call
-again, because at that point nothing durable exists to reuse. Making the point id deterministic
-is the real fix; it belongs in the worker image
-(`docker/worker/tasks/ingestion.py`) and is tracked separately.
+The third leg is still the weakest, but it no longer duplicates. arq refuses a
+duplicate `_job_id` only while that job's result key still exists, and
+`keep_result` is 3600 s in `config/services.yaml` — so a re-dispatch is a no-op
+for one hour after the first delivery, not forever, and a replay later than
+that really does enqueue the job a second time. What that second delivery does
+in Qdrant is the part that changed (ADR-0002 decision 2): `ingest_memory` now
+takes an optional `point_id`, and the sweeper passes
+`uuid5(NAMESPACE_URL, job_id)` (`scripts.session_sweeper.point_id`) for every
+entry it dispatches or re-dispatches, so the
+replay UPSERTS the same point instead of adding a second copy of the same
+memory. `uuid4()` remains the worker's default for every other producer.
+
+The deterministic point id is also what makes a deliberate replay safe — a
+re-extraction of the same slice overwrites its own points rather than
+accumulating them — which is why the operator page documents reconciliation
+only for the two cases it cannot cover: a re-extraction that yields FEWER
+entries (the dropped `job_id`s never recur, so their points are orphaned) and
+points written before this shipped, which carry a `uuid4` id nothing can
+compute back from.
+
+What is guaranteed: no second fabric file, no second ARQ delivery inside the
+result-retention window, no duplicate Qdrant point even outside it, and no
+second LLM call once `mark_extracted` has banked the payload — a crash in the
+window between the model answering and that commit leaves the row at 'claimed',
+and the reclaim correctly pays for the call again, because at that point
+nothing durable exists to reuse.
 
 `import memos_config` MUST come before anything from vendor/ — see
 memos_config/__init__.py.
@@ -89,6 +102,38 @@ SCHEMA = (
     """
     ALTER TABLE sweeper_status
         ADD COLUMN IF NOT EXISTS quarantined INTEGER NOT NULL DEFAULT 0
+    """,
+    # The three circuit-breaker outcomes, same ALTER shape and same reason.
+    # They are here because WITHOUT them the run-level breakers left no durable
+    # trace at all: sweep() computed `aborted`, `locked_out` and
+    # `stale_slices`, main() dropped them on the floor, and the exact scenario
+    # the cross-session breaker exists for -- a misrouting gateway, two or more
+    # sessions, every run claims, fails deterministically, rolls back, aborts
+    # -- wrote `candidates=2, extracted=0, quarantined=0, error=NULL`, run
+    # after run, while burning two LLM calls each time. `quarantined` is
+    # deliberately ZEROED on that path (see session_sweeper.sweep), so the one
+    # signal ADR-0002 names reads 0 exactly when the systemic failure is
+    # happening. `aborted` is what an operator queries instead.
+    """
+    ALTER TABLE sweeper_status
+        ADD COLUMN IF NOT EXISTS aborted BOOLEAN NOT NULL DEFAULT false
+    """,
+    # ONE counter, not two, and that is a decision rather than an omission:
+    # `locked_out` covers both "another sweeper holds this session's advisory
+    # lock" and "we held the lock but the watermark re-read round trip
+    # failed". The sweeper's own comment at that re-read records why (fix
+    # round 1): from the run's perspective the candidate was not safely
+    # processable past the lock step either way, and a third counter for "held
+    # the lock but couldn't confirm freshness" would not tell an operator
+    # anything they would act on differently. Both are transient-by-nature and
+    # both mean "offered again next sweep".
+    """
+    ALTER TABLE sweeper_status
+        ADD COLUMN IF NOT EXISTS locked_out INTEGER NOT NULL DEFAULT 0
+    """,
+    """
+    ALTER TABLE sweeper_status
+        ADD COLUMN IF NOT EXISTS stale_slices INTEGER NOT NULL DEFAULT 0
     """,
 )
 
@@ -347,7 +392,8 @@ def pending_dispatch(conn, limit=50) -> list[dict]:
 
 
 def record_run(conn, *, candidates, extracted, entries, jobs, schema_version, error,
-               redispatched=0, quarantined=0) -> None:
+               redispatched=0, quarantined=0, aborted=False, locked_out=0,
+               stale_slices=0) -> None:
     """One row per run, success or failure — "stalled" has to be a query.
 
     `redispatched` is here because a backlog that never drains is exactly the
@@ -360,13 +406,37 @@ def record_run(conn, *, candidates, extracted, entries, jobs, schema_version, er
     4): nothing alerts on it yet, so this is the signal an operator has to go
     looking for — a non-zero count is a slice that will never be retried
     again without the documented manual replay.
+
+    `aborted`, `locked_out` and `stale_slices` are the run-level circuit
+    breakers and the lock, and they are here for a stronger reason than
+    completeness: every one of them used to be computed by `sweep()` and
+    dropped by `main()`, so the events they describe NEVER REACHED THIS TABLE
+    AT ALL. A misrouting gateway hitting two sessions trips the cross-session
+    breaker, which rolls the attempts back and — correctly — zeroes
+    `quarantined`; the row it left behind read `candidates=2, extracted=0,
+    quarantined=0, error=NULL`, i.e. indistinguishable from a quiet, healthy
+    run, while the sweep burned two LLM calls every 15 minutes. `error` stays
+    NULL there too, because the run did not crash: it defended itself. So
+    `aborted = true` is the only durable evidence that it happened.
+
+    `locked_out` is deliberately ONE counter covering two causes (lock refused,
+    and watermark re-read failed while holding the lock) — see the ALTER's
+    comment in SCHEMA and the sweeper's own note at that re-read.
+
+    All five keyword arguments default, and that is load-bearing rather than
+    tidy: `record_run` has callers that predate each of them (including the
+    fake-backed unit tests), and a required parameter here would turn a
+    bookkeeping addition into a break at the one call site whose whole job is
+    to never raise.
     """
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO sweeper_status
                    (candidates, extracted, entries, jobs, redispatched,
-                    quarantined, schema_version, error)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    quarantined, aborted, locked_out, stale_slices,
+                    schema_version, error)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (candidates, extracted, entries, jobs, redispatched, quarantined,
+             bool(aborted), locked_out, stale_slices,
              schema_version, str(error)[:2000] if error else None))
     conn.commit()
