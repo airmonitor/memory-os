@@ -115,7 +115,9 @@ MECHANICAL_PATTERNS = [
     (re.compile(r"\{\{.*?\}\}|\$\{.*?\}"), ""),
     (re.compile(r"```"), ""),
     (re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"), ""),
-    (re.compile(r"[​-‏ - ⁠-⁤﻿]"), ""),
+    # Escaped ranges, NOT literal invisible characters: a literal class survives
+    # exactly until one editor normalises the file, and then it matches nothing.
+    (re.compile("[\\u200b-\\u200f\\u2028-\\u202f\\u2060-\\u2064\\ufeff]"), ""),
 ]
 
 
@@ -149,7 +151,8 @@ git commit -m "refactor(icarus): the sanitisers become a leaf module"
 **Files:**
 - Modify: `icarus/extraction.py`
 - Modify: `icarus/state.py`
-- Test: `tests/test_extraction_injection.py`
+- Modify: `scripts/session_sweeper.py` (pass `origin="session-sweeper"` at both `write_entry` call sites — the fresh publish and the re-dispatch replay; without this the field ships unwired)
+- Test: `tests/test_extraction_injection.py`, `tests/test_session_sweeper.py`
 
 **Interfaces:**
 - Consumes: `icarus.sanitize.strip_mechanical`.
@@ -285,12 +288,26 @@ def test_point_id_is_a_pure_function_of_the_job_id():
     uuid.UUID(a)
 
 
-def test_the_sweeper_sends_the_point_id_with_every_job():
-    # exercised through the existing FakePg/deps harness in test_session_sweeper.py
-    ...
 ```
 
-(The second assertion is implemented in `tests/test_session_sweeper.py` by extending the existing `enqueue` fake to capture kwargs and asserting `point_id=sw.point_id(job_id)`.)
+And in `tests/test_session_sweeper.py`, extend the existing `enqueue` fake to capture keyword
+arguments, then assert the id travels on both paths:
+
+```python
+def test_every_dispatched_job_carries_its_deterministic_point_id(hermes_db):
+    now = time.time()
+    sessions, messages = rich_session(now)
+    captured = []
+
+    def enqueue(job, *args, job_id, **kw):
+        captured.append((job_id, kw.get("point_id")))
+        return job_id
+
+    deps, _, _ = make_deps(hermes_db(sessions=sessions, messages=messages), FakePg(),
+                           enqueue=enqueue)
+    sw.sweep(deps, CFG)
+    assert captured == [(sw.job_id("s", 12, 0), sw.point_id(sw.job_id("s", 12, 0)))]
+```
 
 - [ ] **Step 2: Run, watch fail** — `AttributeError: module 'scripts.session_sweeper' has no attribute 'point_id'`.
 
@@ -362,12 +379,25 @@ def test_a_missing_key_is_transient_because_it_is_configuration_not_content():
 
 
 def test_unparseable_model_output_is_deterministic():
+    # The gateway answered like a gateway; the MODEL's content is the unusable part.
     def opener(req, timeout=None):
         return io.BytesIO(b'{"choices": [{"message": {"content": "not json"}}]}')
     with pytest.raises(extraction.ExtractionFailed) as e:
         extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
                                    max_tokens=10, timeout=1, opener=opener)
     assert e.value.transient is False
+
+
+def test_a_body_that_is_not_a_chat_completion_is_transient():
+    # A misrouting proxy returns 200 with an HTML error page. That is an outage
+    # wearing a 200, and counting it toward retirement is how an outage becomes
+    # permanent memory loss.
+    def opener(req, timeout=None):
+        return io.BytesIO(b"<html><body>502 upstream</body></html>")
+    with pytest.raises(extraction.ExtractionFailed) as e:
+        extraction.extract_entries("t", base_url="http://x/v1", api_key="k", model="m",
+                                   max_tokens=10, timeout=1, opener=opener)
+    assert e.value.transient is True
 ```
 
 Plus, in `tests/test_session_sweeper.py`:
@@ -375,7 +405,9 @@ Plus, in `tests/test_session_sweeper.py`:
 - a transient failure marks `failed` and does NOT increment attempts (assert via the FakePg's recorded `count_attempt=False`);
 - a deterministic failure at `attempts == max_attempts - 1` marks `quarantined`;
 - a quarantined slice advances the watermark and the session's later messages are still offered;
-- two consecutive transient failures end the sweep (`stats["aborted"] is True`) with the third candidate untouched.
+- two consecutive transient failures end the sweep (`stats["aborted"] is True`) with the third candidate untouched;
+- **deterministic failures in two different sessions inside one run abort the run and roll both back to `failed` with `attempts` unchanged** — a proxy that answers 200 with an unusable body is indistinguishable from bad model output per slice, and only the cross-session pattern separates them (ADR-0002 decision 4). Assert that neither row is `quarantined` and neither `attempts` incremented;
+- a deterministic failure in ONE session, three runs in a row, does reach `quarantined` — the ceiling still works for a genuinely bad slice.
 
 - [ ] **Step 2: Run, watch fail.**
 
@@ -449,7 +481,32 @@ Plus in `tests/test_session_sweeper.py`: a candidate whose lock is refused is sk
 
 - [ ] **Step 2: Run, watch fail.**
 
-- [ ] **Step 3: Implement** — the helper, plus the sweeper taking the lock immediately before `claim()` for that session and counting `stats["locked_out"]`.
+Plus, in `tests/test_session_sweeper.py`, the ordering test that makes the lock worth taking:
+
+```python
+def test_a_slice_built_against_a_stale_watermark_is_dropped_after_locking(hermes_db):
+    # Two sweeps read watermarks(), both build a slice for the same session, the
+    # other one wins the lock and publishes. When this one gets the lock its slice
+    # is already behind the watermark - and because its last_message_id differs,
+    # the unique key would NOT stop it. The re-read is what stops it.
+    ...  # FakePg whose watermarks() advances the moment try_session_lock returns True
+    assert result["extracted"] == 0
+    assert result["stale_slices"] == 1
+```
+
+- [ ] **Step 3: Implement**
+
+The helper, plus this order inside the per-slice loop, which is the whole point of the task:
+
+1. `try_session_lock(conn, session_id)` — skip and count `stats["locked_out"]` when refused;
+2. **re-read that session's watermark** and drop the slice when it has moved past
+   `first_message_id`, counting `stats["stale_slices"]`;
+3. `claim()` as before.
+
+Taking the lock without step 2 protects nothing: two sweeps that both read `watermarks()`
+before either locked will compute *different* slice boundaries for the same messages, so their
+claims do not collide on the unique key and both win. The lock serialises them; the re-read is
+what makes the second one notice.
 
 - [ ] **Step 4: Run the tests, then the suite.**
 
@@ -589,6 +646,13 @@ def test_a_stale_claim_is_reclaimable(conn):
     assert session_store.expire_stale_claims(conn, stale_hours=2) == 1
     assert session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
                                message_count=4) is True
+    # A crash between claim and extraction is transient by nature - OOM, eviction,
+    # a rolled pod. Reclaiming must neither increment attempts (three crashes would
+    # quarantine a slice that never once failed deterministically) nor reset them
+    # (the count would never accumulate across crash cycles).
+    with conn.cursor() as cur:
+        cur.execute("SELECT attempts FROM session_extraction WHERE session_id = %s", (sid,))
+        assert cur.fetchone()[0] == 0
 
 
 def test_the_payload_round_trips_as_jsonb(conn):

@@ -136,13 +136,22 @@ failure this component exists to prevent.
 
 So failures are classified at the point they are raised:
 
-- **Transient** — connection error, timeout, HTTP 5xx, missing credential. The slice is marked
-  `failed`, `attempts` is **not** incremented, and it returns on the next sweep.
-- **Deterministic** — the model answered and its output could not be parsed or validated.
-  `attempts` increments; at `SESSION_MAX_ATTEMPTS` (default 3) the slice becomes
-  `quarantined`.
-- **A run-level circuit breaker**: `SESSION_TRANSIENT_ABORT` (default 2) consecutive transient
-  failures end the sweep immediately. One outage then costs two slots, not the whole backlog.
+- **Transient** — connection error, timeout, HTTP 5xx, a body that is not a chat completion,
+  or a missing credential. The slice is marked `failed`, `attempts` is **not** incremented, and
+  it returns on the next sweep.
+- **Deterministic** — the gateway answered like a gateway and the *model's* output could not be
+  parsed or validated. `attempts` increments; at `SESSION_MAX_ATTEMPTS` (default 3) the slice
+  becomes `quarantined`.
+- **A run-level circuit breaker, on both classes.** `SESSION_TRANSIENT_ABORT` (default 2)
+  consecutive transient failures end the sweep. And — this is the half the first revision
+  missed — **two deterministic failures in different sessions inside one run are treated as
+  systemic**: the run aborts and those attempts are rolled back to `failed` without counting.
+
+**Why the second breaker exists.** The risk register below notes that a proxy returning HTTP
+200 with an HTML error page looks deterministic. It does, and no per-slice classifier can tell
+it from a model that genuinely produced nonsense — the difference is only visible across
+slices. One bad slice fails alone; a misrouting gateway fails every slice it touches. Counting
+*whose* slices failed is what separates them, and it costs one integer.
 
 **`quarantined` advances the watermark, and that is a trade rather than an oversight.** The
 alternative — holding the watermark until an operator acknowledges — blocks every later message
@@ -174,9 +183,12 @@ operator page documents the one-statement replay (`UPDATE … SET status='failed
 
 - **A false sense of safety from the word "sanitised".** The filter removes mechanical hazards
   only. Anyone reading this ADR should take the injection risk as open and managed, not closed.
-- **Quarantine hiding a systemic failure.** The classifier is what keeps an outage out of the
-  ceiling, and it can be wrong: a proxy that returns 200 with a broken body looks deterministic.
-  `sweeper_status.quarantined` is the signal; nothing alerts on it yet.
+- **Quarantine hiding a systemic failure.** The per-slice classifier cannot tell a misrouting
+  proxy from bad model output — both arrive as HTTP 200 with an unusable body. The cross-session
+  breaker is what covers that, and it only fires when at least two *different* sessions fail in
+  one run: a client with a single active conversation gets no such evidence, and its slice can
+  still be retired by three consecutive gateway faults. `sweeper_status.quarantined` is the
+  signal; nothing alerts on it yet.
 
 ## Implementation Notes
 
