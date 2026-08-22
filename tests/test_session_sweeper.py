@@ -1283,3 +1283,45 @@ def test_two_poison_retry_rows_do_not_starve_an_unrelated_fresh_session(build_de
                            extract=raises_deterministic_for("a", "b"))
     sw.sweep(deps, cfg(max_per_run=3, deterministic_sessions_abort=2))
     assert ("published", {"session_id": "c", "last_message_id": 210}) in keys(pg.marks)
+
+
+def test_an_emptied_range_is_quarantined_not_retried_forever(build_deps_with):
+    pg = FakePg()
+    pg.claimed[("s", 10)] = "failed"
+    pg.ranges[("s", 10)] = (1, 10)
+    deps = build_deps_with(pg, messages=[])        # every message went inactive
+    sw.sweep(deps, cfg())
+    assert pg.claimed[("s", 10)] == "quarantined"
+
+
+def test_twenty_transient_failures_never_quarantine(build_deps_with):
+    """The row backs off; it is never retired. A quarantined row counts toward
+    the frontier and the retry pass reads only 'failed' rows, so retiring one
+    over an OUTAGE is how a conversation is lost for good (ADR-0003 dec. 3)."""
+    pg = FakePg()
+    pg.claimed[("s", 10)] = "failed"
+    pg.ranges[("s", 10)] = (1, 10)
+    pg.retries[("s", 10)] = 40                     # far past any plausible ceiling
+    deps = build_deps_with(pg, messages=range(1, 11), extract=raises_transient)
+    sw.sweep(deps, cfg())
+    assert pg.claimed[("s", 10)] == "failed"
+    assert pg.attempts.get(("s", 10), 0) == 0      # never a deterministic failure
+
+
+def test_an_emptied_range_survives_the_cross_session_breakers_zeroing(build_deps_with):
+    """The breaker zeroes `stats["quarantined"]` because every quarantine it
+    could have seen came from a row it just rolled back. An emptied range is
+    the second source, and it is NOT rolled back — the messages really are
+    gone. Zeroing it too would report `quarantined=0` for a slice that is
+    retired for good."""
+    pg = FakePg()
+    for sid, last in (("a", 10), ("b", 110)):
+        pg.claimed[(sid, last)] = "failed"
+        pg.ranges[(sid, last)] = (last - 9, last)
+    deps = build_deps_with(pg, sessions={"a": [], "b": range(101, 111),
+                                         "c": range(201, 211)},
+                           extract=raises_deterministic_for("b", "c"))
+    result = sw.sweep(deps, cfg(max_per_run=3, deterministic_sessions_abort=2))
+    assert result["aborted"] is True
+    assert pg.claimed[("a", 10)] == "quarantined"
+    assert result["quarantined"] == 1

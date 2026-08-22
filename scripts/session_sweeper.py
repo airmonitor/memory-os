@@ -148,6 +148,28 @@ def redispatch(deps: Deps) -> int:
     return sent
 
 
+# THERE IS NO SECOND CEILING, and this log line is what stands in for one.
+# `attempts` counts classified-deterministic failures and quarantines at
+# `max_attempts`; every OTHER producer of 'failed' — a transient failure, an
+# unclassified one, an expired stale claim — is rescheduled on an exponential
+# backoff and never retired. Retiring one would put its messages out of reach
+# of BOTH passes (a quarantined row counts toward the frontier, and the retry
+# pass reads only 'failed' rows), so a five-hour gateway outage would have
+# permanently discarded every slice it touched. That was revision 2 of
+# ADR-0003 and review killed it; decision 3 is what replaced it.
+#
+# So a row backing off toward daily is visible rather than silent. Nothing
+# here is evidence about the conversation — only about the infrastructure.
+_BACKING_OFF_AT = 5
+
+
+def _warn_backing_off(session_id: str, last_message_id: int, retries: int) -> None:
+    if retries >= _BACKING_OFF_AT:                # ~4h and doubling by this point
+        logger.warning("slice %s:%s has failed %d times and is backing off; "
+                       "it will not retire on its own (ADR-0003 decision 3)",
+                       session_id, last_message_id, retries)
+
+
 def sweep(deps: Deps, cfg: dict) -> dict:
     now = deps.now()
     deps.pg.ensure_schema()
@@ -190,6 +212,12 @@ def sweep(deps: Deps, cfg: dict) -> dict:
     # UnboundLocalError on the first owed row. Moved, not duplicated.
     session_id_filter = cfg.get("session_id")
     retry_slices = []
+    # Counted apart from stats["quarantined"] because the cross-session breaker
+    # RESETS that counter, on the argument that every quarantine it could have
+    # seen came from a row it just rolled back. An emptied range is the second
+    # source and is not rolled back — the messages really are gone — so it has
+    # to survive the reset.
+    emptied_ranges = 0
     # At most max_per_run - 1, so a run always has a fresh slot — EXCEPT at
     # max_per_run == 1, where the single slot goes to the retry: with one slice
     # per run neither breaker can trip (both need two), so there is nothing to
@@ -207,12 +235,22 @@ def sweep(deps: Deps, cfg: dict) -> dict:
             deps.sqlite_conn, row["session_id"],
             first_id=row["first_message_id"], last_id=row["last_message_id"])
         if not messages:
-            # Every message in the range went inactive or was rewritten by
-            # compaction since the claim. Skipped rather than swept: with no
-            # messages the transcript is empty, the score is below any
+            # Every message in this range went inactive or was rewritten by
+            # compaction since the claim. There is nothing left to extract, so
+            # retrying is not a slower success — it is a loop. Terminal.
+            #
+            # It has to be SAID, not left to the ordinary path: with no
+            # messages the transcript is empty, the score falls below any
             # threshold, and the slice would close as 'published' — a hole
-            # retired silently as if it had been read. ADR-0003 decision 1
-            # retires it explicitly instead; that is the next commit.
+            # retired silently, as if something had read it.
+            logger.warning("slice %s:%s covers no readable messages any more — "
+                           "quarantining (ADR-0003 decision 1)",
+                           row["session_id"], row["last_message_id"])
+            deps.pg.mark_quarantined(session_id=row["session_id"],
+                                     last_message_id=row["last_message_id"],
+                                     error="range no longer readable")
+            stats["quarantined"] += 1
+            emptied_ranges += 1
             continue
         cand = hermes_state.Candidate(
             row["session_id"], hermes_state.session_source(deps.sqlite_conn, row["session_id"]),
@@ -447,8 +485,10 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                 # conversation (ADR-0002 decision 4).
                 logger.warning("slice %s:%s failed transiently during extraction: %s",
                                cand.session_id, last_id, exc)
-                deps.pg.mark_failed(session_id=cand.session_id, last_message_id=last_id,
-                                    error=exc, count_attempt=False)
+                _, retries = deps.pg.mark_failed(session_id=cand.session_id,
+                                                 last_message_id=last_id,
+                                                 error=exc, count_attempt=False)
+                _warn_backing_off(cand.session_id, last_id, retries)
                 if getattr(exc, "configuration_error", False):
                     # Will not fix itself on retry, and the run stays fail-open
                     # (no quarantine), so a run that never crashes and never
@@ -486,17 +526,28 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                     "aborting sweep: deterministic failures span %d distinct sessions — "
                     "a misrouting gateway looks like bad model output per slice "
                     "(ADR-0002 decision 4)", len(det_sessions))
+                # The cooldown this cohort needs comes for free:
+                # rollback_attempt refunds `attempts` ONLY — never `retries`,
+                # never `next_retry_at` — so every row rolled back here is
+                # still deferred by the backoff its mark_failed just set, and
+                # cannot trip this breaker again on the next cadence
+                # (ADR-0003 decision 3).
                 for r_sid, r_last in det_rows:
                     deps.pg.rollback_attempt(session_id=r_sid, last_message_id=r_last)
-                # Every quarantine this run recorded came from one of the rows
-                # just rolled back — `det_rows` holds EVERY deterministic
-                # failure this run, and all of them are refunded above. Zeroing
-                # (not decrementing) is correct because there is no other
-                # source `stats["quarantined"]` could have been incremented
-                # from. Leaving it non-zero would report a slice as retired
+                # Every DETERMINISTIC quarantine this run recorded came from
+                # one of the rows just rolled back — `det_rows` holds every
+                # deterministic failure this run, and all of them are refunded
+                # above. Leaving those counted would report a slice as retired
                 # when its row is back to plain 'failed' (fix round 1,
                 # "phantom quarantine").
-                stats["quarantined"] = 0
+                #
+                # `emptied_ranges` is the one thing that must survive: those
+                # rows were retired because their messages are GONE from
+                # state.db, which no rollback here undoes and no gateway fault
+                # explains (ADR-0003 decision 1). Reset TO that count, not to
+                # zero — this used to be `= 0`, which was correct only while
+                # the ceiling was the sole way to reach mark_quarantined.
+                stats["quarantined"] = emptied_ranges
                 stats["aborted"] = True
                 break
             if attempts >= cfg["max_attempts"]:
@@ -507,8 +558,10 @@ def sweep(deps: Deps, cfg: dict) -> dict:
         except Exception as exc:                    # one bad slice must not stop the sweep
             logger.warning("slice %s:%s failed during extraction: %s",
                            cand.session_id, last_id, exc)
-            deps.pg.mark_failed(session_id=cand.session_id, last_message_id=last_id,
-                                error=exc, count_attempt=False)
+            _, retries = deps.pg.mark_failed(session_id=cand.session_id,
+                                             last_message_id=last_id,
+                                             error=exc, count_attempt=False)
+            _warn_backing_off(cand.session_id, last_id, retries)
             # Deliberate: an exception this generic isn't classified transient
             # or deterministic, so it resets the streak rather than extending
             # it (fix round 1, Minor 5). Known consequence — an outage that
