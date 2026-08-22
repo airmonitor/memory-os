@@ -34,7 +34,21 @@ class ExtractionFailed(RuntimeError):
     list, and everything else raises. The sweeper's `mark_failed` path turns
     that into a `failed` row, which `watermarks()` excludes, so the slice is
     offered again on the next sweep.
+
+    `transient` decides whether this failure counts against the ceiling
+    (ADR-0002 decision 4). A LiteLLM outage spanning three sweeps must not
+    retire three conversations — that is an outage converted into permanent
+    memory loss, which is exactly what this exception exists to prevent.
+    Transport errors, timeouts, HTTP status errors, a missing API key, and a
+    decoded body that is not a chat completion (no `choices[0].message.content`
+    — the HTTP-200 door a misrouting proxy walks through) are all transient.
+    Only a gateway response that parses as a chat completion, whose MODEL
+    content could not be parsed or validated, is deterministic.
     """
+
+    def __init__(self, message, *, transient):
+        super().__init__(message)
+        self.transient = transient
 
 DECISION_RE = re.compile(
     r"(?i)\b(decided|resolved|completed|fixed|deployed|shipped|reviewed|approved|rejected)\b"
@@ -301,7 +315,8 @@ def extract_entries(transcript, *, base_url, api_key, model, max_tokens, timeout
     to catch this themselves — a memory layer never breaks a turn.
     """
     if not api_key:
-        raise ExtractionFailed("no LiteLLM API key configured — extraction cannot run")
+        raise ExtractionFailed("no LiteLLM API key configured — extraction cannot run",
+                               transient=True)
     payload = json.dumps({
         "model": model,
         "messages": [{"role": "system", "content": EXTRACTION_PROMPT},
@@ -316,13 +331,24 @@ def extract_entries(transcript, *, base_url, api_key, model, max_tokens, timeout
     try:
         raw_body = opener(req, timeout=timeout).read().decode("utf-8")
     except Exception as exc:                      # transport, HTTP status, decode
-        raise ExtractionFailed(f"extraction call failed: {exc}") from exc
+        raise ExtractionFailed(f"extraction call failed: {exc}", transient=True) from exc
     try:
         content = json.loads(raw_body)["choices"][0]["message"]["content"]
-    except Exception as exc:                      # not a chat-completions body
-        raise ExtractionFailed(f"unreadable extraction response: {exc}") from exc
+    except Exception as exc:
+        # Not a chat-completions body — the HTTP-200 door. A misrouting proxy
+        # answers 200 with an HTML error page or its own JSON error shape, and
+        # that is indistinguishable, per slice, from a gateway that is simply
+        # down. Counting it toward the ceiling would let an outage retire a
+        # conversation (ADR-0002 decision 4), so this is transient even though
+        # the HTTP call itself "succeeded".
+        raise ExtractionFailed(f"unreadable extraction response: {exc}",
+                               transient=True) from exc
     parsed = _parse_json(content)
     if parsed is _PARSE_FAILED:
+        # The gateway answered like a gateway; the MODEL's own content is what
+        # could not be parsed. No amount of retrying fixes a model that wrote
+        # nonsense, so this is the one deterministic case — it counts.
         raise ExtractionFailed(
-            f"extraction output was not JSON entries: {(content or '')[:200]!r}")
+            f"extraction output was not JSON entries: {(content or '')[:200]!r}",
+            transient=False)
     return _validate_entries(parsed)

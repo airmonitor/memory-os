@@ -9,7 +9,8 @@ from tests.conftest import SESSION, MSG
 
 HOUR = 3600
 CFG = dict(idle_seconds=90 * 60, min_messages=2, context_overlap=2,
-           max_lag_seconds=24 * HOUR, max_per_run=3, quality_threshold=0.2)
+           max_lag_seconds=24 * HOUR, max_per_run=3, quality_threshold=0.2,
+           max_attempts=3, transient_abort=2)
 
 
 class FakePg:
@@ -23,6 +24,10 @@ class FakePg:
         # Keys whose 'claimed' row is older than STALE_CLAIM_HOURS. Wall-clock
         # ageing is what the real UPDATE does; a test says so directly.
         self.stale = set()
+        # ADR-0002 decision 4: how many DETERMINISTIC failures each row has
+        # accumulated. Independent of `claimed` (status), the way the real
+        # `attempts` column is independent of `status`.
+        self.attempts = {}
 
     def ensure_schema(self): self.calls.append("ensure_schema")
 
@@ -62,8 +67,22 @@ class FakePg:
         self.marks.append(("published", kw))
 
     def mark_failed(self, **kw):
-        self.claimed[(kw["session_id"], kw["last_message_id"])] = "failed"
+        key = (kw["session_id"], kw["last_message_id"])
+        self.claimed[key] = "failed"
+        if kw.get("count_attempt"):
+            self.attempts[key] = self.attempts.get(key, 0) + 1
         self.marks.append(("failed", kw))
+        return self.attempts.get(key, 0)
+
+    def mark_quarantined(self, **kw):
+        self.claimed[(kw["session_id"], kw["last_message_id"])] = "quarantined"
+        self.marks.append(("quarantined", kw))
+
+    def rollback_attempt(self, **kw):
+        key = (kw["session_id"], kw["last_message_id"])
+        self.attempts[key] = max(0, self.attempts.get(key, 0) - 1)
+        self.claimed[key] = "failed"
+        self.marks.append(("rollback", kw))
 
     def pending_dispatch(self):
         return [{"session_id": sid, "last_message_id": last,
@@ -342,6 +361,12 @@ class RaisingPg:
 
     def mark_failed(self, **kw):
         raise AssertionError("mark_failed must not run under --dry-run")
+
+    def mark_quarantined(self, **kw):
+        raise AssertionError("mark_quarantined must not run under --dry-run")
+
+    def rollback_attempt(self, **kw):
+        raise AssertionError("rollback_attempt must not run under --dry-run")
 
     def pending_dispatch(self):
         return []
@@ -679,3 +704,159 @@ def test_write_payload_entry_records_the_sweeper_as_origin():
             "summary": "s", "suffix": "deadbeef"}
     sw.write_payload_entry(deps, item)
     assert calls[0]["origin"] == "session-sweeper"
+
+
+# ── Task 4: classify failures, count only the deterministic ones ─────────
+
+def transient_boom(transcript):
+    raise extraction.ExtractionFailed("proxy down", transient=True)
+
+
+def deterministic_boom(transcript):
+    raise extraction.ExtractionFailed("bad model output", transient=False)
+
+
+def three_eligible_sessions(now):
+    """Three quiet, substantive sessions — same shape as `two_eligible_sessions`,
+    with a third so the run-level breaker can be checked against a candidate
+    that must never even be claimed."""
+    sessions, messages, last_ids = [], [], {}
+    for n in range(3):
+        sid = f"s{n}"
+        sessions.append(SESSION(sid, last_activity_at=now - 2 * HOUR, message_count=4))
+        base = 100 * n
+        for i in range(2):
+            messages.append(MSG(base + 2 * i + 1, sid, "user", "u" * 60))
+            messages.append(MSG(base + 2 * i + 2, sid, "assistant",
+                                "decided. Result: works. " + "d" * 200))
+        last_ids[sid] = base + 4
+    return sessions, messages, last_ids
+
+
+def test_a_transient_failure_marks_failed_without_incrementing_attempts(hermes_db):
+    """ADR-0002 decision 4: an outage must not spend one of the tries a
+    genuinely bad slice gets. Goes through the REAL extract_entries (as the
+    FIX-1 tests do), not a fake that raises — a fake never distinguished
+    transient from deterministic."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = FakePg()
+    deps, _, _ = make_deps(path, pg)
+    deps.extract = real_extract_against(raising_opener)
+
+    result = sw.sweep(deps, CFG)
+    assert pg.claimed[("s", 12)] == "failed"
+    assert pg.attempts.get(("s", 12), 0) == 0
+    assert result["aborted"] is False
+    failed = [kw for kind, kw in pg.marks if kind == "failed"]
+    assert failed[-1]["count_attempt"] is False
+
+
+def test_a_deterministic_failure_at_the_ceiling_quarantines(hermes_db):
+    now = time.time()
+    sessions, messages = rich_session(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = FakePg()
+    pg.attempts[("s", 12)] = CFG["max_attempts"] - 1
+    deps, _, _ = make_deps(path, pg)
+    deps.extract = deterministic_boom
+
+    result = sw.sweep(deps, CFG)
+    assert pg.claimed[("s", 12)] == "quarantined"
+    assert result["quarantined"] == 1
+    assert result["aborted"] is False
+    assert pg.attempts[("s", 12)] == CFG["max_attempts"]
+
+
+def test_a_quarantined_slice_advances_the_watermark_and_later_messages_are_offered(hermes_db):
+    now = time.time()
+    sessions, messages = rich_session(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = FakePg()
+    pg.attempts[("s", 12)] = CFG["max_attempts"] - 1
+    deps, _, _ = make_deps(path, pg)
+    deps.extract = deterministic_boom
+    sw.sweep(deps, CFG)
+    assert pg.claimed[("s", 12)] == "quarantined"
+    # Only 'failed' is excluded from the watermark — the retired slice must
+    # not block the session's later messages behind it forever.
+    assert pg.watermarks() == {"s": 12}
+
+    con = sqlite3.connect(path)
+    con.execute(
+        "INSERT INTO messages (id, session_id, role, content, tool_calls, tool_name,"
+        " timestamp, active, compacted) VALUES (?, ?, ?, ?, '', NULL, ?, 1, 0)",
+        (13, "s", "user", "w" * 60, now))
+    con.execute(
+        "INSERT INTO messages (id, session_id, role, content, tool_calls, tool_name,"
+        " timestamp, active, compacted) VALUES (?, ?, ?, ?, '', NULL, ?, 1, 0)",
+        (14, "s", "assistant", "decided once more. Result: works. " + "e" * 200, now))
+    con.commit()
+    con.close()
+
+    deps2, _, _ = make_deps(path, pg)
+    result2 = sw.sweep(deps2, CFG)
+    assert result2["extracted"] == 1
+    assert pg.claimed[("s", 14)] == "published"
+
+
+def test_two_consecutive_transient_failures_abort_the_sweep(hermes_db):
+    now = time.time()
+    sessions, messages, _ = three_eligible_sessions(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = FakePg()
+    deps, _, _ = make_deps(path, pg)
+    deps.extract = transient_boom
+
+    result = sw.sweep(deps, CFG)
+    assert result["aborted"] is True
+    assert result["candidates"] == 3
+    # Two candidates were claimed and failed; the third was never claimed —
+    # not just left alone, genuinely untouched.
+    assert len(pg.claimed) == 2
+    assert all(status == "failed" for status in pg.claimed.values())
+    assert all(pg.attempts.get(key, 0) == 0 for key in pg.claimed)
+
+
+def test_deterministic_failures_in_two_different_sessions_abort_and_roll_back(hermes_db):
+    """ADR-0002 decision 4, the half a per-slice classifier cannot see on its
+    own: a proxy answering 200 with an unusable body is indistinguishable
+    from bad model output per slice. Two DIFFERENT sessions failing the same
+    way in one run is what separates a misrouting gateway from two unlucky
+    slices — so both rows return to exactly the state they had before this
+    run touched them."""
+    now = time.time()
+    sessions, messages, _ = two_eligible_sessions(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = FakePg()
+    deps, _, _ = make_deps(path, pg)
+    deps.extract = deterministic_boom
+
+    result = sw.sweep(deps, CFG)
+    assert result["aborted"] is True
+    assert result["quarantined"] == 0
+    assert len(pg.claimed) == 2
+    assert all(status == "failed" for status in pg.claimed.values())
+    assert all(pg.attempts.get(key, 0) == 0 for key in pg.claimed)
+
+
+def test_a_deterministic_failure_reaches_quarantine_after_max_attempts_runs(hermes_db):
+    """The other half of the ceiling: a genuinely bad slice, alone in its
+    session across separate runs, still gets retired — the cross-session
+    breaker only fires on failures spread across DIFFERENT sessions."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = FakePg()
+    for i in range(CFG["max_attempts"]):
+        deps, _, _ = make_deps(path, pg)
+        deps.extract = deterministic_boom
+        result = sw.sweep(deps, CFG)
+        if i < CFG["max_attempts"] - 1:
+            assert result["aborted"] is False
+            assert pg.claimed[("s", 12)] == "failed"
+        else:
+            assert pg.claimed[("s", 12)] == "quarantined"
+            assert result["quarantined"] == 1
+    assert pg.attempts[("s", 12)] == CFG["max_attempts"]

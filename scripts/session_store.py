@@ -78,6 +78,18 @@ SCHEMA = (
     ALTER TABLE sweeper_status
         ADD COLUMN IF NOT EXISTS redispatched INTEGER NOT NULL DEFAULT 0
     """,
+    # session_extraction predates `attempts` (ADR-0002 decision 4) for the same
+    # reason — the migration path for an existing table is an ALTER, not the
+    # CREATE above. Counts only genuine, classified-deterministic extraction
+    # failures; see mark_failed and claim.
+    """
+    ALTER TABLE session_extraction
+        ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0
+    """,
+    """
+    ALTER TABLE sweeper_status
+        ADD COLUMN IF NOT EXISTS quarantined INTEGER NOT NULL DEFAULT 0
+    """,
 )
 
 
@@ -110,7 +122,9 @@ _CLAIM_RECLAIM_SQL = f"""
     INSERT INTO session_extraction {_CLAIM_INSERT_COLUMNS}
     VALUES (%s, %s, %s, %s)
     ON CONFLICT (session_id, last_message_id) DO UPDATE
-        SET status = 'claimed', claimed_at = now(), updated_at = now()
+        SET status = 'claimed', claimed_at = now(), updated_at = now(),
+            attempts = session_extraction.attempts
+                + CASE WHEN %s THEN 1 ELSE 0 END
         WHERE session_extraction.status = 'failed'
            OR (session_extraction.status = 'claimed'
                AND session_extraction.updated_at
@@ -151,7 +165,7 @@ def expire_stale_claims(conn, *, stale_hours=STALE_CLAIM_HOURS) -> int:
 
 
 def claim(conn, *, session_id, first_message_id, last_message_id, message_count,
-          stale_hours=None) -> bool:
+          stale_hours=None, count_attempt=True) -> bool:
     """Win the right to extract this slice. False means somebody else owns it.
 
     THE RECLAIM STEP IS NOT DECORATION. A crash between the claim and the
@@ -174,17 +188,26 @@ def claim(conn, *, session_id, first_message_id, last_message_id, message_count,
     `STALE_CLAIM_HOURS` — so the production call site does not have to remember
     to opt in. Passing `stale_hours` explicitly skips straight to the reclaim
     statement.
+
+    `count_attempt` (default True) governs whether reclaiming an EXISTING row
+    bumps `attempts`. The sweeper's own call always passes `count_attempt=False`
+    — grabbing ownership of a slice is not yet attempting it, and ADR-0002
+    decision 4 counts only genuine, classified-deterministic extraction
+    failures (via `mark_failed`). This keeps the guarantee true here too: a
+    crash-recovered claim (`expire_stale_claims` already turned the row
+    'failed', see that function) must not increment attempts, and this default
+    is what a caller gets if it forgets to say otherwise.
     """
     ins = (session_id, first_message_id, last_message_id, message_count)
     with conn.cursor() as cur:
         if stale_hours is not None:
-            cur.execute(_CLAIM_RECLAIM_SQL, (*ins, stale_hours))
+            cur.execute(_CLAIM_RECLAIM_SQL, (*ins, count_attempt, stale_hours))
             won = cur.fetchone() is not None
         else:
             cur.execute(_CLAIM_FAST_SQL, ins)
             won = cur.fetchone() is not None
             if not won:
-                cur.execute(_CLAIM_RECLAIM_SQL, (*ins, STALE_CLAIM_HOURS))
+                cur.execute(_CLAIM_RECLAIM_SQL, (*ins, count_attempt, STALE_CLAIM_HOURS))
                 won = cur.fetchone() is not None
     conn.commit()
     return won
@@ -206,9 +229,71 @@ def mark_published(conn, *, session_id, last_message_id, jobs) -> None:
             "status = 'published', jobs = %s", (json.dumps(list(jobs)),))
 
 
-def mark_failed(conn, *, session_id, last_message_id, error) -> None:
-    _update(conn, session_id, last_message_id, "status = 'failed', error = %s",
+_MARK_FAILED_SQL = """
+    UPDATE session_extraction
+       SET status = 'failed', error = %s,
+           attempts = attempts + CASE WHEN %s THEN 1 ELSE 0 END,
+           updated_at = now()
+     WHERE session_id = %s AND last_message_id = %s
+    RETURNING attempts
+"""
+
+
+def mark_failed(conn, *, session_id, last_message_id, error, count_attempt=False) -> int:
+    """Mark a slice retryable and return its `attempts` count after this call.
+
+    `count_attempt` is the classification decision itself (ADR-0002 decision
+    4): a transient failure (connection error, timeout, HTTP status error, a
+    missing key, or a decoded body that is not a chat completion) calls this
+    with `count_attempt=False` — an outage must not spend one of the three
+    tries a genuinely bad slice gets. A deterministic failure (the gateway
+    answered like a gateway; the model's own content did not parse or
+    validate) calls this with `count_attempt=True`, and the caller compares
+    the returned value against `session_extraction.max_attempts` to decide
+    whether to quarantine instead.
+    """
+    with conn.cursor() as cur:
+        cur.execute(_MARK_FAILED_SQL,
+                    (str(error)[:2000], count_attempt, session_id, last_message_id))
+        row = cur.fetchone()
+    conn.commit()
+    return int(row[0]) if row else 0
+
+
+def mark_quarantined(conn, *, session_id, last_message_id, error) -> None:
+    """Retire a slice that hit the deterministic-failure ceiling.
+
+    Only status and error change — the payload column is left as-is (there
+    normally is none, since extraction never once succeeded for this slice).
+    `watermarks()` excludes only 'failed', so a quarantined slice still counts
+    toward the watermark and the session's later messages are not blocked
+    behind one that will never parse (ADR-0002 decision 4). The one-statement
+    operator replay is `UPDATE session_extraction SET status='failed',
+    attempts=0 WHERE ...`.
+    """
+    _update(conn, session_id, last_message_id, "status = 'quarantined', error = %s",
             (str(error)[:2000],))
+
+
+_ROLLBACK_ATTEMPT_SQL = """
+    UPDATE session_extraction
+       SET status = 'failed', attempts = GREATEST(attempts - 1, 0), updated_at = now()
+     WHERE session_id = %s AND last_message_id = %s
+"""
+
+
+def rollback_attempt(conn, *, session_id, last_message_id) -> None:
+    """Undo one counted deterministic failure.
+
+    Used only by the sweeper's cross-session circuit breaker: two
+    deterministic failures in different sessions inside one run are systemic
+    (a misrouting gateway), not two bad slices, so the run aborts and every
+    attempt it spent this run is refunded — the row is left exactly as if the
+    ceiling had never been touched (ADR-0002 decision 4).
+    """
+    with conn.cursor() as cur:
+        cur.execute(_ROLLBACK_ATTEMPT_SQL, (session_id, last_message_id))
+    conn.commit()
 
 
 def _update(conn, session_id, last_message_id, assignment, params) -> None:
@@ -230,7 +315,7 @@ def pending_dispatch(conn, limit=50) -> list[dict]:
 
 
 def record_run(conn, *, candidates, extracted, entries, jobs, schema_version, error,
-               redispatched=0) -> None:
+               redispatched=0, quarantined=0) -> None:
     """One row per run, success or failure — "stalled" has to be a query.
 
     `redispatched` is here because a backlog that never drains is exactly the
@@ -238,13 +323,18 @@ def record_run(conn, *, candidates, extracted, entries, jobs, schema_version, er
     get re-offered every sweep, so a non-zero count that never falls to zero
     means the broker is not accepting them. It used to be computed by `sweep()`
     and thrown away into a log line.
+
+    `quarantined` is the same idea for the failure ceiling (ADR-0002 decision
+    4): nothing alerts on it yet, so this is the signal an operator has to go
+    looking for — a non-zero count is a slice that will never be retried
+    again without the documented manual replay.
     """
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO sweeper_status
                    (candidates, extracted, entries, jobs, redispatched,
-                    schema_version, error)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-            (candidates, extracted, entries, jobs, redispatched, schema_version,
-             str(error)[:2000] if error else None))
+                    quarantined, schema_version, error)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (candidates, extracted, entries, jobs, redispatched, quarantined,
+             schema_version, str(error)[:2000] if error else None))
     conn.commit()

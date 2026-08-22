@@ -127,6 +127,15 @@ session_extraction:
   max_lag_hours: ${SESSION_MAX_LAG_HOURS:24}
   max_per_run: ${SESSION_MAX_PER_RUN:3}
   quality_threshold: ${SESSION_QUALITY_THRESHOLD:0.2}
+  # ADR-0002 decision 4: a deterministic failure counts toward this ceiling; a
+  # transient one (a LiteLLM outage, say) never does. 3 tries for a genuinely
+  # bad slice before it is quarantined.
+  max_attempts: ${SESSION_MAX_ATTEMPTS:3}
+  # The run-level circuit breaker, on both classes: this many consecutive
+  # transient failures, OR deterministic failures spread across this many
+  # DIFFERENT sessions in one run, abort the sweep — either shape is a
+  # misrouting gateway, not bad slices.
+  transient_abort: ${SESSION_TRANSIENT_ABORT:2}
 
 logging:
   level: INFO

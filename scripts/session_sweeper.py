@@ -171,6 +171,7 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                        live_schema, hermes_state.KNOWN_SCHEMA_VERSION)
 
     stats = {"candidates": 0, "extracted": 0, "entries": 0, "jobs": 0,
+             "quarantined": 0, "aborted": False,
              "redispatched": redispatch(deps)}
     marks = deps.pg.watermarks()
     warned_compacted = False
@@ -207,15 +208,33 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                                                 limit=cfg["context_overlap"]) if after else []
             slices.append((cand, context, messages))
 
+    # Run-local circuit breaker state (ADR-0002 decision 4). `transient_streak`
+    # counts CONSECUTIVE transient failures — any non-transient outcome resets
+    # it, since "consecutive" is the whole signal: an isolated timeout is
+    # noise, an unbroken run of them is an outage. `det_sessions`/`det_rows`
+    # track EVERY deterministic failure this run, by distinct session id: two
+    # different sessions failing deterministically in one run is what a
+    # misrouting gateway looks like, since its HTTP-200 door is indistinguishable
+    # per slice from a model that genuinely wrote nonsense. Both breakers share
+    # `cfg["transient_abort"]` as their threshold (ADR-0002: "on both classes").
+    transient_streak = 0
+    det_sessions: set[str] = set()
+    det_rows: list[tuple[str, int]] = []
+
     for cand, context, messages in slices:
         first_id, last_id = messages[0].id, messages[-1].id
         # claim() is a Postgres round trip like any other and can raise (a
         # dropped connection, a lock timeout). One bad slice must not stop the
         # sweep, so a raise here is logged and this slice is skipped — it will
         # be offered again on the next sweep, since nothing was claimed.
+        #
+        # count_attempt=False: claiming ownership of a slice is not yet
+        # attempting it. Only a classified deterministic failure (below) counts
+        # against the ceiling.
         try:
             won = deps.pg.claim(session_id=cand.session_id, first_message_id=first_id,
-                                last_message_id=last_id, message_count=len(messages))
+                                last_message_id=last_id, message_count=len(messages),
+                                count_attempt=False)
         except Exception as exc:
             logger.warning("claim for slice %s:%s failed: %s", cand.session_id, last_id, exc)
             continue
@@ -236,20 +255,69 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                                        entries=0, score=score["total"])
                 deps.pg.mark_published(session_id=cand.session_id, last_message_id=last_id,
                                        jobs=[])
+                transient_streak = 0
                 continue
             entries = deps.extract(extraction.build_transcript(messages, context=context))
             stats["extracted"] += 1
+            transient_streak = 0
             platform = cand.source or "cli"
             payload = [payload_item(cand.session_id, last_id, i, e, platform)
                        for i, e in enumerate(entries)]
             deps.pg.mark_extracted(session_id=cand.session_id, last_message_id=last_id,
                                    entries=len(entries), score=score["total"],
                                    payload=payload)
+        except extraction.ExtractionFailed as exc:
+            if exc.transient:
+                # An outage, not a bad slice: never counted, so a proxy or
+                # model outage spanning several sweeps cannot retire a
+                # conversation (ADR-0002 decision 4).
+                logger.warning("slice %s:%s failed transiently during extraction: %s",
+                               cand.session_id, last_id, exc)
+                deps.pg.mark_failed(session_id=cand.session_id, last_message_id=last_id,
+                                    error=exc, count_attempt=False)
+                transient_streak += 1
+                if transient_streak >= cfg["transient_abort"]:
+                    logger.warning(
+                        "aborting sweep: %d consecutive transient extraction failures — "
+                        "likely a gateway outage, not bad slices", transient_streak)
+                    stats["aborted"] = True
+                    break
+                continue
+            # Deterministic: the gateway answered like a gateway; the model's
+            # own content did not parse or validate. This one counts.
+            logger.warning("slice %s:%s failed deterministically during extraction: %s",
+                           cand.session_id, last_id, exc)
+            transient_streak = 0
+            attempts = deps.pg.mark_failed(session_id=cand.session_id, last_message_id=last_id,
+                                           error=exc, count_attempt=True)
+            det_rows.append((cand.session_id, last_id))
+            det_sessions.add(cand.session_id)
+            if len(det_sessions) >= cfg["transient_abort"]:
+                # Systemic, not three bad slices: a misrouting gateway answers
+                # every slice's request with an unusable-but-200 body, and
+                # that is indistinguishable per slice from a model that wrote
+                # nonsense — only the cross-session pattern separates them.
+                # Refund every attempt this run spent; the row is left exactly
+                # as if the ceiling had never been touched.
+                logger.warning(
+                    "aborting sweep: deterministic failures span %d distinct sessions — "
+                    "a misrouting gateway looks like bad model output per slice "
+                    "(ADR-0002 decision 4)", len(det_sessions))
+                for r_sid, r_last in det_rows:
+                    deps.pg.rollback_attempt(session_id=r_sid, last_message_id=r_last)
+                stats["aborted"] = True
+                break
+            if attempts >= cfg["max_attempts"]:
+                deps.pg.mark_quarantined(session_id=cand.session_id, last_message_id=last_id,
+                                         error=exc)
+                stats["quarantined"] += 1
+            continue
         except Exception as exc:                    # one bad slice must not stop the sweep
             logger.warning("slice %s:%s failed during extraction: %s",
                            cand.session_id, last_id, exc)
             deps.pg.mark_failed(session_id=cand.session_id, last_message_id=last_id,
-                                error=exc)
+                                error=exc, count_attempt=False)
+            transient_streak = 0
             continue
 
         # Dispatch phase: the slice is ALREADY 'extracted' and its payload is
@@ -306,6 +374,8 @@ def _load_cfg(cfg_module) -> dict:
         max_lag_seconds=int(g("max_lag_hours", 24)) * 3600,
         max_per_run=int(g("max_per_run", 3)),
         quality_threshold=float(g("quality_threshold", 0.2)),
+        max_attempts=int(g("max_attempts", 3)),
+        transient_abort=int(g("transient_abort", 2)),
     )
 
 
@@ -339,6 +409,12 @@ class _PgAdapter:
 
     def mark_failed(self, **kw):
         return session_store.mark_failed(self.conn, **kw)
+
+    def mark_quarantined(self, **kw):
+        return session_store.mark_quarantined(self.conn, **kw)
+
+    def rollback_attempt(self, **kw):
+        return session_store.rollback_attempt(self.conn, **kw)
 
     def pending_dispatch(self):
         return session_store.pending_dispatch(self.conn)
@@ -387,7 +463,11 @@ def _dry_run_stubs(deps: Deps, pg: _PgAdapter) -> None:
     pg.mark_published = lambda **kw: logger.info(
         "[dry-run] would mark_published %s:%s", kw.get("session_id"), kw.get("last_message_id"))
     pg.mark_failed = lambda **kw: logger.info(
-        "[dry-run] would mark_failed %s:%s", kw.get("session_id"), kw.get("last_message_id"))
+        "[dry-run] would mark_failed %s:%s", kw.get("session_id"), kw.get("last_message_id")) or 0
+    pg.mark_quarantined = lambda **kw: logger.info(
+        "[dry-run] would mark_quarantined %s:%s", kw.get("session_id"), kw.get("last_message_id"))
+    pg.rollback_attempt = lambda **kw: logger.info(
+        "[dry-run] would rollback_attempt %s:%s", kw.get("session_id"), kw.get("last_message_id"))
     pg.record_run = lambda **kw: logger.info("[dry-run] would record_run %s", kw)
 
     def extract_stub(transcript):
@@ -482,7 +562,7 @@ def main(argv=None) -> dict:
             deps.pg.record_run(
                 candidates=r.get("candidates", 0), extracted=r.get("extracted", 0),
                 entries=r.get("entries", 0), jobs=r.get("jobs", 0),
-                redispatched=r.get("redispatched", 0),
+                redispatched=r.get("redispatched", 0), quarantined=r.get("quarantined", 0),
                 schema_version=hermes_state.schema_version(sqlite_conn), error=error)
         except Exception:
             logger.exception("failed to record sweeper_status row")
