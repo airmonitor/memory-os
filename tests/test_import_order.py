@@ -3,38 +3,135 @@ import pathlib
 import pytest
 
 SCRIPTS = sorted(pathlib.Path("scripts").glob("*.py"))
+VENDORED = {"psycopg", "qdrant_client", "arq", "redis"}
+
+# Anything imported inside one of these never runs at module-import time, so
+# it cannot reproduce the sys.path bug: a function/async-function/class body
+# only executes when called/instantiated, and a `try:` block (the common
+# optional-dependency `try/except ImportError` guard) is deliberately allowed
+# here too. The rule this test encodes is precise: nothing vendored may be
+# imported AT MODULE LEVEL above memos_config — not "nowhere above it in
+# source order".
+DEFERRED_CONTEXTS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Try)
+
+
+def _parent_map(tree):
+    parents = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+    return parents
+
+
+def _is_deferred(node, parents):
+    current = parents.get(node)
+    while current is not None:
+        if isinstance(current, DEFERRED_CONTEXTS):
+            return True
+        current = parents.get(current)
+    return False
+
+
+def _vendored_above_memos_config(tree, filename):
+    """Module-level vendored imports that sit above memos_config.
+
+    Returns None if the file never imports memos_config (caller should skip),
+    else a list of failure strings (empty means the file is clean).
+    """
+    parents = _parent_map(tree)
+    memos_line = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "memos_config":
+            memos_line = node.lineno if memos_line is None else min(memos_line, node.lineno)
+    if memos_line is None:
+        return None
+
+    failures = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if _is_deferred(node, parents):
+            continue
+        names = []
+        if isinstance(node, ast.Import):
+            names = [a.name.split(".")[0] for a in node.names]
+        elif node.module:
+            names = [node.module.split(".")[0]]
+        for name in names:
+            if name in VENDORED and node.lineno <= memos_line:
+                failures.append(
+                    f"{filename}:{node.lineno} imports {name} above memos_config "
+                    f"(line {memos_line})")
+    return failures
 
 
 @pytest.mark.parametrize("path", SCRIPTS, ids=lambda p: p.name)
 def test_memos_config_is_imported_before_anything_vendored(path):
     """vendor/ reaches sys.path through memos_config's import side effect.
 
-    Anything imported above it raises ModuleNotFoundError in the deployed pod —
-    which is what cost memoryos-reflection-trigger its first 32 runs.
+    Anything imported at MODULE LEVEL above it raises ModuleNotFoundError in
+    the deployed pod — which is what cost memoryos-reflection-trigger its
+    first 32 runs. A deferred import (inside a function, a class body, or a
+    try/except guard) never runs at import time, so it cannot reproduce that
+    failure and is allowed regardless of its source position.
     """
-    VENDORED = {"psycopg", "qdrant_client", "arq", "redis"}
     tree = ast.parse(path.read_text())
-    memos_line = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == "memos_config":
-            memos_line = node.lineno if memos_line is None else min(memos_line, node.lineno)
-    if memos_line is None:
+    failures = _vendored_above_memos_config(tree, path.name)
+    if failures is None:
         pytest.skip(f"{path.name} does not use memos_config")
-    for node in ast.walk(tree):
-        names = []
-        if isinstance(node, ast.Import):
-            names = [a.name.split(".")[0] for a in node.names]
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names = [node.module.split(".")[0]]
-        for name in names:
-            if name in VENDORED:
-                assert node.lineno > memos_line, (
-                    f"{path.name}:{node.lineno} imports {name} above memos_config "
-                    f"(line {memos_line})")
+    assert failures == []
+
+
+def test_a_deferred_vendored_import_does_not_fail_the_rule(tmp_path):
+    """Positive case for the module-level scoping above, on a throwaway
+    fixture rather than whichever real script happens to have this shape
+    today — depending on someone else's file layout is the same fragility
+    one level up.
+
+    `import arq` here sits above `from memos_config import config` by source
+    position, but it is inside a function body and therefore never executes
+    at module-import time, so the rule must not fail it.
+    """
+    fixture = tmp_path / "fixture_deferred_import.py"
+    fixture.write_text(
+        "def lazy_worker():\n"
+        "    from arq import create_pool\n"
+        "    return create_pool\n"
+        "\n"
+        "from memos_config import config\n"
+    )
+    tree = ast.parse(fixture.read_text())
+    failures = _vendored_above_memos_config(tree, fixture.name)
+    assert failures == []
 
 
 def test_the_lineage_hash_width_agrees_across_writers():
-    hooks = pathlib.Path("icarus/hooks.py").read_text()
+    """AST-based lookup, not string-split: `hooks.split("register_lineage")[-1]`
+    would silently mis-scope if a later occurrence of that name (e.g. a new
+    docstring mention) landed below the call this test cares about — the
+    same truncating-lookup shape this repo already has a lesson about (an
+    assertion that got its expectation through the same truncating lookup as
+    the code under test, and passed while the files it compared differed).
+    """
+    hooks_tree = ast.parse(pathlib.Path("icarus/hooks.py").read_text())
     enhancer = pathlib.Path("scripts/context_enhancer.py").read_text()
-    assert "hexdigest()[:16]" not in hooks.split("register_lineage")[-1]
+
+    hash_kw = None
+    for node in ast.walk(hooks_tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "register_lineage"):
+            for kw in node.keywords:
+                if kw.arg == "generation_context_hash":
+                    hash_kw = kw.value
+    assert hash_kw is not None, "no register_lineage(...) call found in icarus/hooks.py"
+    assert isinstance(hash_kw, ast.Subscript), (
+        "expected icarus/hooks.py's generation_context_hash= to be a "
+        "hexdigest()[:N] slice")
+    sl = hash_kw.slice
+    width = sl.upper.value if isinstance(sl, ast.Slice) and isinstance(sl.upper, ast.Constant) else None
+    assert width == 32, (
+        f"icarus/hooks.py's register_lineage call uses a {width}-hex hash; "
+        "expected 32 to match scripts/context_enhancer.py's writer")
+
     assert enhancer.count("hexdigest()[:32]") >= 1
