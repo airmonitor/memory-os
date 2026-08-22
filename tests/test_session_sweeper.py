@@ -1087,3 +1087,20 @@ def test_a_slice_built_against_a_stale_watermark_is_dropped_after_locking(hermes
     assert written == [] and jobs == []
     # Never claimed either — the other sweep already owns this slice.
     assert ("s", 12) not in pg.claimed
+
+
+def test_the_real_adapter_answers_everything_the_sweeper_asks_of_pg():
+    """_PgAdapter has explicit one-line delegates and NO __getattr__ fallback,
+    so a method sweep() calls that the adapter is missing raises AttributeError
+    in production — which the retry block catches as its fail-open `owed = []`.
+    The sweeper would then log one warning and never retry anything, while the
+    frontier keeps the fresh pass from reaching those rows either, and every
+    unit test would still pass because FakePg has the method. This walks the
+    fake against the adapter so the next missing delegate is caught here.
+
+    Measured to fail for the right reason: deleting the `slice_status` delegate
+    while adding one to FakePg turns it red with `assert not {'slice_status'}`.
+    """
+    used = {name for name in dir(FakePg) if not name.startswith("_")}
+    missing = used - {n for n in dir(sw._PgAdapter) if not n.startswith("_")}
+    assert not missing, f"_PgAdapter is missing {missing}; sweep() would fail open and do nothing"

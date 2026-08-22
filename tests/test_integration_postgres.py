@@ -418,3 +418,43 @@ def test_the_backoff_survives_a_row_that_failed_forty_times(conn):
         cur.execute("SELECT next_retry_at - now() < interval '25 hours' "
                     "FROM session_extraction WHERE session_id='s' AND last_message_id=10")
         assert cur.fetchone()[0] is True
+
+
+def test_failed_slices_returns_only_failed_rows_that_are_due(conn):
+    from scripts import session_store
+    for last, status in ((10, "failed"), (20, "published"), (30, "quarantined")):
+        session_store.claim(conn, session_id="s", first_message_id=last - 9,
+                            last_message_id=last, message_count=10)
+        if status == "failed":
+            session_store.mark_failed(conn, session_id="s", last_message_id=last, error="x")
+        elif status == "published":
+            session_store.mark_published(conn, session_id="s", last_message_id=last, jobs=[])
+        else:
+            session_store.mark_quarantined(conn, session_id="s", last_message_id=last,
+                                           error="x")
+    # (s,10) is failed, but mark_failed just scheduled it 15 minutes out, so it
+    # is not DUE. Due-ness and status are two different questions.
+    assert session_store.failed_slices(conn) == []
+    with conn.cursor() as cur:
+        cur.execute("UPDATE session_extraction SET next_retry_at = now() - interval '1 minute' "
+                    "WHERE session_id='s' AND last_message_id=10")
+    conn.commit()
+    rows = session_store.failed_slices(conn)
+    assert [(r["session_id"], r["first_message_id"], r["last_message_id"]) for r in rows] \
+        == [("s", 1, 10)]
+
+
+def test_a_row_that_predates_the_column_is_due_immediately(conn):
+    from scripts import session_store
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    session_store.mark_failed(conn, session_id="s", last_message_id=10, error="x")
+    with conn.cursor() as cur:
+        cur.execute("UPDATE session_extraction SET next_retry_at = NULL")
+    conn.commit()
+    assert len(session_store.failed_slices(conn)) == 1
+
+
+def test_slice_status_is_none_for_a_row_that_does_not_exist(conn):
+    from scripts import session_store
+    assert session_store.slice_status(conn, "nobody", 1) is None

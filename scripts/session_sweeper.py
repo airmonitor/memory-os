@@ -507,6 +507,12 @@ class _PgAdapter:
     def pending_dispatch(self):
         return session_store.pending_dispatch(self.conn)
 
+    def failed_slices(self, **kw):
+        return session_store.failed_slices(self.conn, **kw)
+
+    def slice_status(self, **kw):
+        return session_store.slice_status(self.conn, **kw)
+
     def record_run(self, **kw):
         return session_store.record_run(self.conn, **kw)
 

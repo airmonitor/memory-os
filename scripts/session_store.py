@@ -498,6 +498,63 @@ def pending_dispatch(conn, limit=50) -> list[dict]:
         return []
 
 
+def failed_slices(conn, limit=50) -> list[dict]:
+    """Slices that owe an answer, oldest first.
+
+    'failed' ONLY. A 'quarantined' row is terminal by definition and must never
+    come back here, or the ceiling that retired it would retire it again every
+    sweep forever. 'claimed' is somebody else's work in flight — expire_stale_
+    claims is what turns an abandoned one into a 'failed' row this can see, and
+    it runs at the top of every sweep for exactly that reason.
+
+    DUE ONLY. `next_retry_at` is the backoff clock (ADR-0003 decision 3): a row
+    that keeps failing is pushed further out each time rather than retired, so
+    it stops costing a sweep every cadence without its messages being thrown
+    away. NULL is due — that is every row written before the column existed.
+
+    Oldest first (by updated_at) so a hole that has been open longest is
+    offered before a fresh failure, and so the ordering is stable across sweeps
+    rather than whatever the planner returns.
+
+    Returns [] when the table does not exist yet, for the same reason
+    pending_dispatch does: `--dry-run` against a database that has never been
+    swept must report what it would do, not crash on a missing relation.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT session_id, first_message_id, last_message_id, attempts, retries
+                     FROM session_extraction
+                    WHERE status = 'failed'
+                      AND (next_retry_at IS NULL OR next_retry_at <= now())
+                    ORDER BY updated_at ASC
+                    LIMIT %s""", (limit,))
+            rows = cur.fetchall()
+    except psycopg.errors.UndefinedTable:
+        conn.rollback()
+        return []
+    return [{"session_id": r[0], "first_message_id": int(r[1]),
+             "last_message_id": int(r[2]), "attempts": int(r[3]),
+             "retries": int(r[4])} for r in rows]
+
+
+def slice_status(conn, session_id: str, last_message_id: int) -> str | None:
+    """One row's status, or None if there is no such row.
+
+    Exists for the sweeper's post-lock freshness re-read on a RETRY slice, and
+    the targeting is the point: `failed_slices` is a windowed, due-filtered
+    list, so asking "is my row still in it" reports a false "somebody else
+    resolved this" the moment there are more than `limit` owed rows. Status is
+    the only question that re-read is actually asking.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT status FROM session_extraction "
+                    "WHERE session_id = %s AND last_message_id = %s",
+                    (session_id, last_message_id))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
 def record_run(conn, *, candidates, extracted, entries, jobs, schema_version, error,
                redispatched=0, quarantined=0, aborted=False, locked_out=0,
                stale_slices=0) -> None:
