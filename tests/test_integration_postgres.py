@@ -10,13 +10,26 @@ module against a real server.
 Skipped unless MEMOS_TEST_DSN is set, so the default suite stays offline:
     MEMOS_TEST_DSN=postgresql://user:pass@localhost:5432/memos_test .venv/bin/pytest -m integration
 
-Each test claims a fresh, randomly-suffixed session_id and the `conn` fixture
-drops both tables on teardown, so the file can run twice IN SEQUENCE against
-the same database without colliding with a previous run. That teardown is
-also why two runs must never overlap and this must never point at a database
-anything else is using: a concurrent run's DROP TABLE deletes the other run's
-rows out from under it, and pointing this at a shared database drops that
-database's own session_extraction/sweeper_status bookkeeping.
+Each test claims a fresh, randomly-suffixed session_id, and the `conn` fixture
+gives every TEST its own throwaway PostgreSQL schema (`CREATE SCHEMA
+test_<random>`, `search_path` pointed at it before `ensure_schema` ever runs),
+dropped with `CASCADE` on teardown. Nothing this file creates can collide
+with, or be dropped alongside, anything a real deployment or a colleague's run
+put in `public` — `session_store`'s statements never qualify a schema, so
+whatever `search_path` names at connect time is where its tables land, and a
+schema unique to this connection is what keeps that from ever being `public`.
+That is what makes the file safe to point at a live database in the first
+place, not just at a disposable container.
+
+Sequential re-runs against the same database are MEASURED safe (two runs in a
+row, same container, both green — see VERIFY in the tickets 16/17 handover).
+Concurrent runs are reasoned safe for the tables (disjoint schemas cannot
+collide) but NOT measured, and one thing schema isolation does not cover:
+`pg_try_advisory_xact_lock` keys are cluster-wide, not schema-scoped, so two
+overlapping runs choosing the same lock-test session id could still contend
+with each other. Every lock-test session id in this file is randomised for
+exactly that reason — treat a fixed string there as a latent collision, not a
+readability nicety.
 """
 import os
 import uuid
@@ -32,19 +45,27 @@ pytestmark = [pytest.mark.integration,
 def conn():
     from scripts import session_store
     c = psycopg.connect(DSN)
+    schema = f"test_{uuid.uuid4().hex[:12]}"
+    with c.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA {schema}")
+        cur.execute(f"SET search_path TO {schema}")
+    # CREATE SCHEMA and SET are both transaction-scoped in PostgreSQL: either
+    # would be silently undone by a rollback of the transaction that issued
+    # them. Doing them here and calling ensure_schema() next, with no commit
+    # in between, means all three land in the ONE transaction ensure_schema's
+    # own conn.commit() seals — after that, nothing a test does (including the
+    # INERROR rollback below) can undo the schema or the search_path, only
+    # rows inside the schema.
     session_store.ensure_schema(c)
     yield c
     # A genuine psycopg.Error mid-test (not just an AssertionError) leaves the
     # connection INERROR, and a transaction in that state rejects everything,
-    # including this teardown's own DROP TABLE, with "current transaction is
-    # aborted". Left unhandled, that leaks the tables and their rows into the
-    # database and breaks the next run's exact-count assertions - the very
-    # property the module docstring above promises for sequential re-runs.
-    # rollback() is a no-op on an already-clean transaction, so it is safe to
-    # call unconditionally here.
+    # including this teardown's own DROP SCHEMA, with "current transaction is
+    # aborted". rollback() is a no-op on an already-clean transaction, so it
+    # is safe to call unconditionally here.
     c.rollback()
     with c.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS session_extraction, sweeper_status")
+        cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
     c.commit()
     c.close()
 
@@ -138,8 +159,12 @@ def test_ensure_schema_is_idempotent_against_a_live_server(conn):
     from scripts import session_store
     session_store.ensure_schema(conn)          # second call must not raise
     with conn.cursor() as cur:
+        # table_schema = current_schema() matters now that every test runs
+        # inside its own schema: without it, a live database with its own
+        # public.sweeper_status would union columns across both and could
+        # false-pass this even if THIS test's table were missing them.
         cur.execute("SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name = 'sweeper_status'")
+                    "WHERE table_name = 'sweeper_status' AND table_schema = current_schema()")
         cols = {r[0] for r in cur.fetchall()}
     assert {"redispatched", "quarantined", "aborted", "locked_out",
             "stale_slices"} <= cols
@@ -192,10 +217,10 @@ def test_ensure_schema_upgrades_an_existing_table_missing_the_new_columns(conn):
 
     with conn.cursor() as cur:
         cur.execute("SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name = 'session_extraction'")
+                    "WHERE table_name = 'session_extraction' AND table_schema = current_schema()")
         se_cols = {r[0] for r in cur.fetchall()}
         cur.execute("SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name = 'sweeper_status'")
+                    "WHERE table_name = 'sweeper_status' AND table_schema = current_schema()")
         ss_cols = {r[0] for r in cur.fetchall()}
     assert "attempts" in se_cols
     # The circuit-breaker columns are on this list for the same reason as the
@@ -284,13 +309,55 @@ def test_rollback_attempt_decrements_without_going_below_zero(conn):
 
 def test_the_session_lock_is_released_by_the_transaction(conn):
     from scripts import session_store
+    # Randomised: pg_try_advisory_xact_lock keys are cluster-wide, not scoped
+    # to this test's schema, so a fixed literal here could collide with a
+    # concurrently-running copy of this same file (see the module docstring).
+    lock_key = f"lock-me-{uuid.uuid4()}"
     other = psycopg.connect(DSN)
     try:
         with conn.transaction():
-            assert session_store.try_session_lock(conn, "lock-me") is True
-            assert session_store.try_session_lock(other, "lock-me") is False
+            assert session_store.try_session_lock(conn, lock_key) is True
+            assert session_store.try_session_lock(other, lock_key) is False
         # transaction over -> the lock is gone without anyone releasing it
         with other.transaction():
-            assert session_store.try_session_lock(other, "lock-me") is True
+            assert session_store.try_session_lock(other, lock_key) is True
     finally:
+        other.close()
+
+
+def test_the_production_lock_sequence_holds_across_watermarks_and_releases_at_claim(conn):
+    """Drives the PRODUCTION sequence `sweep()` actually uses — never
+    `with conn.transaction():`, which is the construct being avoided here.
+
+    Production opens its transaction IMPLICITLY: `try_session_lock()` takes
+    the advisory xact lock and deliberately does not commit (see its
+    docstring), `watermarks()` in between is a plain read that does not
+    commit either, and `claim()`'s own `conn.commit()` is what ends the
+    transaction — which is also what releases the lock. That sequence is what
+    holds the lock across the watermark re-read and the claim, while
+    releasing it before the LLM call `extract()` makes next. Nothing here
+    proves that by construction; it proves it by driving the real functions
+    in the real order and watching a second connection get refused, then
+    granted, at the right moments.
+    """
+    from scripts import session_store
+    lock_key = f"prod-sequence-{uuid.uuid4()}"
+    sid = f"s-{uuid.uuid4()}"
+    other = psycopg.connect(DSN)
+    try:
+        assert session_store.try_session_lock(conn, lock_key) is True
+        # The watermark re-read the fix depends on (session_sweeper.sweep,
+        # "THE RE-READ IS THE FIX, NOT THE LOCK"). A plain SELECT — must not
+        # commit, and does not, in the real function.
+        session_store.watermarks(conn)
+        # Still held: a second connection must be refused across the re-read,
+        # exactly as it would be mid-sweep on a real host.
+        assert session_store.try_session_lock(other, lock_key) is False
+        # claim() is the ONLY commit in this sequence in production.
+        assert session_store.claim(conn, session_id=sid, first_message_id=1,
+                                   last_message_id=9, message_count=4) is True
+        # Released now that claim() has committed — before any LLM call runs.
+        assert session_store.try_session_lock(other, lock_key) is True
+    finally:
+        other.rollback()
         other.close()
