@@ -136,10 +136,19 @@ every later sweep until its connection dies — an unbounded stall traded for a 
 double-extraction. The transaction-scoped variant releases on commit or rollback, including
 the rollback a crashed process gets for free.
 
-The `flock -n` in the cron line stays as the cheaper first line, and it is the only protection
-when PostgreSQL itself is unreachable. Today's deployment is one host per client, so the
-database lock is defence for a topology that does not exist yet; it is one line, and the
-alternative is remembering to add it the day a second sweeper appears.
+~~The `flock -n` in the cron line stays as the cheaper first line, and it is the only protection
+when PostgreSQL itself is unreachable.~~ **FALSE — corrected 2026-08-22 by
+[ADR-0003](0003-the-watermark-is-a-contiguous-prefix.md) decision 4.** There is no `flock` in
+the cron line and there never was: the installed wrapper
+`/opt/data/scripts/memoryos-session-sweeper.sh` is four lines of `unset`/`cd`/`exec` and
+`grep -c flock` on it returns `0` (measured on the reference host), and the template it renders
+from carries none either. This paragraph asserted a first line of defence that did not exist,
+and the stranding in #14 needed no operator error to happen because of it. The lock now lives
+in the CLI, where it also covers a manual `--session` run.
+
+Today's deployment is one host per client, so the database lock is defence for a topology that
+does not exist yet; it is one line, and the alternative is remembering to add it the day a
+second sweeper appears.
 
 ### 4. Classify the failure before counting it (#5)
 
