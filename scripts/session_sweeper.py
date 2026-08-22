@@ -133,7 +133,9 @@ def redispatch(deps: Deps) -> int:
             for item in row["payload"]:
                 job = item.get("job_id")
                 deps.enqueue("process_ingestion", item["text"], "session",
-                             job_id=item["job_id"], point_id=point_id(job) if job else None)
+                             job_id=item["job_id"], point_id=point_id(job) if job else None,
+                             session_id=row["session_id"],
+                             last_message_id=row["last_message_id"])
                 job_ids.append(item["job_id"])
             deps.pg.mark_published(session_id=row["session_id"],
                                    last_message_id=row["last_message_id"], jobs=job_ids)
@@ -407,8 +409,15 @@ def sweep(deps: Deps, cfg: dict) -> dict:
             job_ids = []
             for item in payload:
                 job = item.get("job_id")
+                # session_id and last_message_id become PAYLOAD on the Qdrant
+                # point. Without them `source` is the constant "session" for
+                # every point the sweeper writes, and nothing says which
+                # conversation a memory came from - so a re-extraction that
+                # yields a different number of entries orphans the old points
+                # with no filter that can select them.
                 deps.enqueue("process_ingestion", item["text"], "session",
-                             job_id=item["job_id"], point_id=point_id(job) if job else None)
+                             job_id=item["job_id"], point_id=point_id(job) if job else None,
+                             session_id=cand.session_id, last_message_id=last_id)
                 job_ids.append(item["job_id"])
                 stats["jobs"] += 1
             deps.pg.mark_published(session_id=cand.session_id, last_message_id=last_id,

@@ -111,7 +111,7 @@ def make_deps(path, pg, *, entries=None, enqueue=None):
         written.append(kw)
         return f"/fabric/{kw['suffix']}.md"
 
-    def _enqueue(job, *args, job_id, point_id=None):
+    def _enqueue(job, *args, job_id, **kw):
         jobs.append(job_id)
         return job_id
     return sw.Deps(sqlite_conn=hs.connect_ro(path), pg=pg,
@@ -130,6 +130,26 @@ def test_a_quiet_substantive_session_is_extracted_published_and_dispatched(herme
     assert result["extracted"] == 1 and result["entries"] == 1 and result["jobs"] == 1
     assert written[0]["suffix"] == sw.entry_suffix("s", 12, 0)
     assert jobs == [sw.job_id("s", 12, 0)]
+
+
+def test_every_dispatched_job_carries_its_conversation_provenance(hermes_db):
+    """Without these two fields nothing in a Qdrant point says WHICH conversation
+    it came from: `source` is the constant "session" for every point the sweeper
+    writes. A re-extraction that yields a different number of entries then
+    orphans the old points with no filter that can select them.
+    """
+    now = time.time()
+    sessions, messages = rich_session(now)
+    seen = []
+
+    def enqueue(job, *args, job_id, **kw):
+        seen.append((kw.get("session_id"), kw.get("last_message_id")))
+        return job_id
+
+    deps, _, _ = make_deps(hermes_db(sessions=sessions, messages=messages), FakePg(),
+                           enqueue=enqueue)
+    sw.sweep(deps, CFG)
+    assert seen == [("s", 12)]
 
 
 def test_every_dispatched_job_carries_its_deterministic_point_id(hermes_db):
@@ -200,7 +220,7 @@ def test_a_slice_that_failed_to_dispatch_goes_out_on_the_next_sweep(hermes_db):
     path = hermes_db(sessions=sessions, messages=messages)
     pg = FakePg()
 
-    def boom(job, *args, job_id, point_id=None):
+    def boom(job, *args, job_id, **kw):
         raise RuntimeError("valkey down")
 
     deps, _, _ = make_deps(path, pg, enqueue=boom)
@@ -209,7 +229,7 @@ def test_a_slice_that_failed_to_dispatch_goes_out_on_the_next_sweep(hermes_db):
 
     sent = []
 
-    def ok(job, *args, job_id, point_id=None):
+    def ok(job, *args, job_id, **kw):
         sent.append(job_id)
         return job_id
 
@@ -227,7 +247,7 @@ def test_dispatch_failure_leaves_the_slice_re_runnable(hermes_db):
     now = time.time()
     sessions, messages = rich_session(now)
 
-    def boom(job, *args, job_id, point_id=None):
+    def boom(job, *args, job_id, **kw):
         raise RuntimeError("valkey down")
     pg = FakePg()
     deps, written, _ = make_deps(hermes_db(sessions=sessions, messages=messages), pg,

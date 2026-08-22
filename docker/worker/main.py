@@ -68,17 +68,27 @@ async def shutdown(ctx):
 
 # ─── ARQ function definitions ────────────────────────────────────────────
 async def process_ingestion(ctx, memory_text: str, source: str, tags: list = None,
-                            point_id: str = None):
+                            point_id: str = None, session_id: str = None,
+                            last_message_id: int = None):
     """ARQ job: ingest a memory into the vector store.
 
-    `point_id` is optional so a job enqueued by an older producer — one that
-    never set this kwarg — still runs: it falls through as None and
-    `ingest_memory` picks a fresh uuid4, same as before this parameter existed.
+    `point_id`, `session_id` and `last_message_id` are all optional so a job
+    enqueued by an older producer — one that never set these kwargs — still
+    runs: they fall through as None, `ingest_memory` picks a fresh uuid4 and
+    writes the payload it always wrote.
+
+    THE REVERSE IS NOT TRUE, and it cost two memories on 2026-08-22: a NEWER
+    producer sending a kwarg an older worker does not accept fails inside the
+    worker with TypeError, after the producer has already marked the slice
+    published. The worker image deploys BEFORE or WITH the producer, never
+    after.
     Only the session sweeper passes it, to make a replayed dispatch upsert
     its point instead of adding a second one; legacy points already in Qdrant
     are not migrated by this.
     """
-    return await ingest_memory(ctx["qdrant"], memory_text, source, tags, point_id=point_id)
+    return await ingest_memory(ctx["qdrant"], memory_text, source, tags,
+                               point_id=point_id, session_id=session_id,
+                               last_message_id=last_message_id)
 
 
 async def process_wiki_file(ctx, file_path: str):

@@ -32,6 +32,8 @@ async def ingest_memory(
     source: str,
     tags: list | None = None,
     point_id: str | None = None,
+    session_id: str | None = None,
+    last_message_id: int | None = None,
 ) -> dict:
     """
     Ingests an episodic memory into Qdrant.
@@ -71,6 +73,18 @@ async def ingest_memory(
         "reflection_count": 0,
         "last_reflected": None,
     }
+
+    # PROVENANCE, and it is the difference between "delete this conversation's
+    # memories" being a filter and being impossible. `source` is the constant
+    # "session" for every point the sweeper writes, so without these two fields
+    # nothing in the payload says WHICH conversation a point came from: a
+    # re-extraction that produces a different number of entries orphans the old
+    # points with no way to select them. Added 2026-08-22; both stay optional so
+    # every other producer's payload shape is unchanged.
+    if session_id:
+        payload["session_id"] = session_id
+    if last_message_id is not None:
+        payload["last_message_id"] = int(last_message_id)
 
     point = PointStruct(
         id=point_id,
