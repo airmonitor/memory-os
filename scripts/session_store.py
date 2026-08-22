@@ -51,6 +51,14 @@ if str(_REPO) not in sys.path:
 
 from memos_config import config  # noqa: E402,F401
 
+# BELOW memos_config, never above: that import's side effect is what puts
+# vendor/ on sys.path in the deployed pod. tests/test_import_order.py enforces
+# it for every script in this tree.
+import logging  # noqa: E402
+import psycopg  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
 STALE_CLAIM_HOURS = 2
 
 SCHEMA = (
@@ -383,12 +391,27 @@ def _update(conn, session_id, last_message_id, assignment, params) -> None:
 
 
 def pending_dispatch(conn, limit=50) -> list[dict]:
-    """Slices extracted but never dispatched — a crash or a broker outage."""
-    with conn.cursor() as cur:
-        cur.execute("""SELECT session_id, last_message_id, payload FROM session_extraction
-                       WHERE status = 'extracted' ORDER BY id ASC LIMIT %s""", (limit,))
-        return [{"session_id": r[0], "last_message_id": int(r[1]), "payload": r[2] or []}
-                for r in cur.fetchall()]
+    """Slices extracted but never dispatched — a crash or a broker outage.
+
+    Returns [] when the table does not exist yet, instead of raising. That is
+    not defensive noise: `sweep()` calls this through `redispatch()` BEFORE it
+    does anything else, and `--dry-run` stubs `ensure_schema` precisely so a
+    dry run creates nothing. On a database where the sweeper has never run for
+    real, those two facts meet and `--dry-run` dies with UndefinedTable on the
+    first thing it touches — measured on the semitora host, 2026-08-22, on the
+    very first dry run against a fresh database. A dry run that cannot survive
+    a fresh database is useless exactly when an operator most wants one.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT session_id, last_message_id, payload FROM session_extraction
+                           WHERE status = 'extracted' ORDER BY id ASC LIMIT %s""", (limit,))
+            return [{"session_id": r[0], "last_message_id": int(r[1]), "payload": r[2] or []}
+                    for r in cur.fetchall()]
+    except psycopg.errors.UndefinedTable:
+        conn.rollback()          # the failed statement poisons the transaction
+        logger.info("session_extraction does not exist yet — nothing to re-dispatch")
+        return []
 
 
 def record_run(conn, *, candidates, extracted, entries, jobs, schema_version, error,
