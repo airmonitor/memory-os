@@ -1325,3 +1325,11 @@ def test_an_emptied_range_survives_the_cross_session_breakers_zeroing(build_deps
     assert result["aborted"] is True
     assert pg.claimed[("a", 10)] == "quarantined"
     assert result["quarantined"] == 1
+
+
+def test_a_second_sweeper_exits_zero_without_sweeping(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMOS_SWEEPER_LOCK", str(tmp_path / "sweeper.lock"))
+    with sw.run_lock() as first:
+        assert first is True
+        with sw.run_lock() as second:
+            assert second is False

@@ -30,3 +30,6 @@ venv/
 CLAUDE.md
 # Worktrees
 .worktrees/
+
+# Sweeper run lock (scripts/session_sweeper.py run_lock default path)
+.sweeper.lock

@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import fcntl
 import functools
 import hashlib
 import itertools
 import logging
+import os
 import sys
 import time
 import uuid
@@ -819,6 +822,38 @@ def build_deps(*, dry_run: bool = False):
     return deps, pg_conn, sqlite_conn, enqueuer
 
 
+@contextlib.contextmanager
+def run_lock(path=None):
+    """Exclusive, host-local, for EVERY invocation — cron and manual alike.
+
+    ADR-0002 claimed a `flock -n` in the cron line as the cheap first line of
+    defence. It does not exist: measured 2026-08-22, the installed wrapper
+    /opt/data/scripts/memoryos-session-sweeper.sh is four lines and `grep -c
+    flock` on it returns 0. So two sweeps genuinely could overlap — a sweep
+    slower than the 15-minute cadence is enough — which is how #14's hole forms
+    with no operator error at all.
+
+    It lives HERE and not in the wrapper because a wrapper cannot cover a
+    manual `--session` run, and a manual run racing the cron is the documented
+    shape of that bug. A file lock is sufficient because state.db is host-local:
+    two sweepers on different hosts is not a topology this component has.
+
+    Whether `hermes cron` serialises its own executions was never determined.
+    With this unconditional, it does not have to be.
+    """
+    path = path or os.environ.get("MEMOS_SWEEPER_LOCK", str(_REPO / ".sweeper.lock"))
+    fh = open(path, "w")
+    try:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        fh.close()
+
+
 def main(argv=None) -> dict:
     parser = argparse.ArgumentParser(
         description="Session sweeper — extract quiet Hermes conversations into fabric "
@@ -828,71 +863,83 @@ def main(argv=None) -> dict:
     parser.add_argument("--session", metavar="ID",
                         help="Only consider this session id, if it is a candidate")
     parser.add_argument("--verbose", action="store_true", help="Debug-level logging")
+    parser.add_argument("--no-lock", action="store_true",
+                        help="Skip the exclusive run lock — for a controlled recovery run only")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    cfg = _load_cfg(config)
-    if args.session:
-        cfg["session_id"] = args.session
-        # find_candidates() cuts at max_per_run BEFORE the --session filter
-        # runs, so a target session ranked below that cut would silently
-        # report zero candidates. Widen the fetch for this one-off case.
-        cfg["max_per_run"] = max(cfg["max_per_run"], 50)
+    if args.no_lock:
+        logger.warning("--no-lock: running without the exclusive sweeper lock")
+    with run_lock() if not args.no_lock else contextlib.nullcontext(True) as acquired:
+        if not acquired:
+            logger.info("another sweeper holds the lock — nothing to do")
+            # Exit 0, not non-zero: a skipped tick is the lock working, and
+            # `hermes cron --no-agent` delivers stdout verbatim, so a non-zero
+            # exit would page an operator every time a sweep runs long.
+            return 0
 
-    deps, pg_conn, sqlite_conn, enqueuer = build_deps(dry_run=args.dry_run)
-    result, error = None, None
-    try:
-        result = sweep(deps, cfg)
-        logger.info("sweep result: %s", result)
-        return result
-    except Exception as exc:
-        error = exc
-        raise
-    finally:
-        # "Stalled" must be a query, not an inspection (ADR-0001 §5): every
-        # run — success or failure — leaves a sweeper_status row. Routed
-        # through deps.pg (not scripts.session_store directly against
-        # pg_conn), so --dry-run's stubbing of deps.pg.record_run actually
-        # covers this call instead of being bypassed by a second write path.
-        #
-        # EVERY KEY sweep() COMPUTES IS PASSED, and the three at the end are
-        # the ones this used to drop. A run that ends on the cross-session
-        # breaker returns normally (sweep() breaks out of the loop and returns
-        # its stats), so `error` is NULL, and the breaker zeroes `quarantined`
-        # because it refunded every attempt — leaving `candidates=2,
-        # extracted=0, quarantined=0, error=NULL`, the shape of a quiet
-        # healthy run, for a gateway that is failing every slice it touches.
-        # `aborted`/`locked_out`/`stale_slices` are what make that queryable
-        # (fix wave 2026-08-22; see session_store.record_run).
-        #
-        # `error` prefers the crash (`error`, set in the except above, non-NULL
-        # only when sweep() itself raised) over `r["last_error"]` — the last
-        # ExtractionFailed this run saw with `configuration_error=True` (a 4xx
-        # that is not 429). That second source is what makes a config problem
-        # visible here at all: it never raises out of sweep() (fail-open, ticket
-        # #17) and never trips `aborted` on its own, so without it a run that
-        # spent every slice failing on a rotated key would still write
-        # `error=NULL` — indistinguishable from a healthy one except by reading
-        # `session_extraction.error` directly, which is exactly the blind spot
-        # this column exists to remove.
-        r = result or {}
+        cfg = _load_cfg(config)
+        if args.session:
+            cfg["session_id"] = args.session
+            # find_candidates() cuts at max_per_run BEFORE the --session filter
+            # runs, so a target session ranked below that cut would silently
+            # report zero candidates. Widen the fetch for this one-off case.
+            cfg["max_per_run"] = max(cfg["max_per_run"], 50)
+
+        deps, pg_conn, sqlite_conn, enqueuer = build_deps(dry_run=args.dry_run)
+        result, error = None, None
         try:
-            deps.pg.record_run(
-                candidates=r.get("candidates", 0), extracted=r.get("extracted", 0),
-                entries=r.get("entries", 0), jobs=r.get("jobs", 0),
-                redispatched=r.get("redispatched", 0), quarantined=r.get("quarantined", 0),
-                aborted=r.get("aborted", False), locked_out=r.get("locked_out", 0),
-                stale_slices=r.get("stale_slices", 0), retried=r.get("retried", 0),
-                schema_version=hermes_state.schema_version(sqlite_conn),
-                error=error or r.get("last_error"))
-        except Exception:
-            logger.exception("failed to record sweeper_status row")
-        sqlite_conn.close()
-        if enqueuer is not None:
-            enqueuer.close()
-        pg_conn.close()
+            result = sweep(deps, cfg)
+            logger.info("sweep result: %s", result)
+            return result
+        except Exception as exc:
+            error = exc
+            raise
+        finally:
+            # "Stalled" must be a query, not an inspection (ADR-0001 §5): every
+            # run — success or failure — leaves a sweeper_status row. Routed
+            # through deps.pg (not scripts.session_store directly against
+            # pg_conn), so --dry-run's stubbing of deps.pg.record_run actually
+            # covers this call instead of being bypassed by a second write path.
+            #
+            # EVERY KEY sweep() COMPUTES IS PASSED, and the three at the end are
+            # the ones this used to drop. A run that ends on the cross-session
+            # breaker returns normally (sweep() breaks out of the loop and returns
+            # its stats), so `error` is NULL, and the breaker zeroes `quarantined`
+            # because it refunded every attempt — leaving `candidates=2,
+            # extracted=0, quarantined=0, error=NULL`, the shape of a quiet
+            # healthy run, for a gateway that is failing every slice it touches.
+            # `aborted`/`locked_out`/`stale_slices` are what make that queryable
+            # (fix wave 2026-08-22; see session_store.record_run).
+            #
+            # `error` prefers the crash (`error`, set in the except above, non-NULL
+            # only when sweep() itself raised) over `r["last_error"]` — the last
+            # ExtractionFailed this run saw with `configuration_error=True` (a 4xx
+            # that is not 429). That second source is what makes a config problem
+            # visible here at all: it never raises out of sweep() (fail-open, ticket
+            # #17) and never trips `aborted` on its own, so without it a run that
+            # spent every slice failing on a rotated key would still write
+            # `error=NULL` — indistinguishable from a healthy one except by reading
+            # `session_extraction.error` directly, which is exactly the blind spot
+            # this column exists to remove.
+            r = result or {}
+            try:
+                deps.pg.record_run(
+                    candidates=r.get("candidates", 0), extracted=r.get("extracted", 0),
+                    entries=r.get("entries", 0), jobs=r.get("jobs", 0),
+                    redispatched=r.get("redispatched", 0), quarantined=r.get("quarantined", 0),
+                    aborted=r.get("aborted", False), locked_out=r.get("locked_out", 0),
+                    stale_slices=r.get("stale_slices", 0), retried=r.get("retried", 0),
+                    schema_version=hermes_state.schema_version(sqlite_conn),
+                    error=error or r.get("last_error"))
+            except Exception:
+                logger.exception("failed to record sweeper_status row")
+            sqlite_conn.close()
+            if enqueuer is not None:
+                enqueuer.close()
+            pg_conn.close()
 
 
 if __name__ == "__main__":
