@@ -1,6 +1,6 @@
 # ADR-0003: A failed slice is retried at its own range, and the watermark is the frontier
 
-**Status**: Proposed (revision 2 — revision 1 was reviewed and rejected; see "What revision 1 got wrong")
+**Status**: Proposed (revision 3 — revisions 1 and 2 were reviewed and rejected; see "What the earlier revisions got wrong")
 **Date**: 2026-08-22
 **Deciders**: operator (semitora), icarus/memory-os maintainers
 **Extends**: [ADR-0001](0001-session-extraction-via-state-db-sweeper.md), [ADR-0002](0002-hardening-the-session-sweeper.md)
@@ -54,7 +54,9 @@ answer to that question skips the hole. #15 is what happens when the answer to i
 
 Fix the re-derivation and both stop.
 
-## What revision 1 got wrong
+## What the earlier revisions got wrong
+
+### Revision 1
 
 Revision 1 kept the re-derivation and tried to steer it: it capped the watermark at
 `MIN(first_message_id) FILTER (WHERE status='failed') - 1`, so the fresh path would be aimed at
@@ -77,13 +79,27 @@ before this rewrite:
    while being unable to ever reach the ceiling — the 45-minute worst case was wrong before the
    two-hour stale-claim window is even considered.
 
-Revision 2 keeps neither decision.
+Revision 2 kept neither decision.
+
+### Revision 2
+
+Revision 2's core survived its review untouched — the exact-range retry and the frontier
+watermark are decisions 1 and 2 below, unchanged. Two things around them were rejected, and both
+were confirmed against the code before this rewrite:
+
+1. **Its bound discarded data.** A universal 20-retry ceiling that quarantines is a ceiling that
+   loses conversations to a network outage. Decision 3 is rewritten around backoff.
+2. **Its retry-first ordering starves fresh work.** Both circuit breakers end the run with
+   `break` over a single list, so two failing retry rows in different sessions abort a sweep
+   before any fresh candidate is reached. Decision 1 now interleaves.
 
 ## Decision Drivers
 
 - A memory is written once and read for months; losing one silently is the worst outcome here.
 - A conversation that keeps arriving must not be held up by one slice that will never parse.
-- Whatever bounds a retry must be a counter that ordinary activity cannot reset.
+- A retry that will not succeed must stop costing a sweep every cadence. Bounding its RATE is
+  the requirement; bounding its COUNT is not, because the only way to stop counting is to throw
+  the messages away.
 - No new table. A column via `ADD COLUMN IF NOT EXISTS` is the established migration path here.
 
 ## Decisions
@@ -103,8 +119,13 @@ Everything that was hard becomes mechanical:
   stable by construction, so there is nothing to inherit.
 - A hole under a published watermark is offered again without the watermark having to express it.
 
-**The retry path runs before the fresh path**, so a session that owes an answer gives it before
-it takes on more work.
+**Within one session, the retry comes first** — a session that owes an answer gives it before it
+takes on more work. ACROSS sessions the two kinds are interleaved, `[retry, fresh, retry, …]`,
+and retries take at most `max_per_run - 1` of a run's budget so at least one fresh slot always
+survives. A strict retry-first ordering was revision 2's rule and it starves: both circuit
+breakers end a run with `break`, so two failing retry rows in different sessions abort the run
+before any fresh candidate is reached, every cadence. Interleaving means a fresh slice has
+already been processed by the time the second retry can trip anything.
 
 **Retry slices skip the `idle_seconds` and `min_messages` gates.** Those gates ask "has this
 conversation finished growing" — a question already answered for a range that was claimed once.
@@ -141,25 +162,52 @@ Both cases check out:
 Note what the second row costs: **nothing**. The tail is not held hostage by the hole, which is
 revision 1's entire "negative consequence" section deleted rather than accepted.
 
-### 3. Every producer of `failed` gets a bounded exit
+### 3. A non-deterministic failure is rescheduled, never retired
 
 `attempts` counts *classified deterministic* failures only, and that is right — an outage must
 not spend the budget that exists for unparseable content (ADR-0002 decision 4). But it leaves
 three producers of `failed` with no exit at all: `expire_stale_claims`, transient failures, and
-unclassified ones. Under decision 1 those rows are retried forever.
+unclassified ones. Under decision 1 those rows are retried every sweep forever.
 
-A second column, `retries INTEGER NOT NULL DEFAULT 0`, incremented on **every** transition into
-`failed` regardless of classification. At `memory_os_session_retry_ceiling` (default 20) the row
-is `quarantined` with `exhausted after N retries`. `rollback_attempt` refunds `attempts` only —
-a run the breaker aborted still consumed a retry, because it did.
+**The exit is not a ceiling.** Revision 2 proposed retiring such a row after 20 retries, and
+review rejected it for a reason that holds: a `quarantined` row still counts toward the frontier
+(decision 2) while the retry pass reads only `failed` rows, so quarantining is how messages
+become unreachable from *both* paths. A five-hour credential or gateway outage would have
+permanently discarded every slice it touched — bounding the retries by abandoning the work. The
+first decision driver says losing a memory silently is the worst outcome here; that design was
+the worst outcome, on a timer.
 
-**Why a counter and not a maximum age.** An age bound punishes the wrong outage: a stack that
-was down for two days would quarantine every open slice on the first boot after it, having never
-retried any of them. A counter only advances when work was actually attempted.
+**Exponential backoff instead.** A second column, `next_retry_at TIMESTAMPTZ`, and a `retries`
+counter that only ever increments:
 
-At the 15-minute cadence, 20 retries is five hours of continuous failure before a slice is
-retired — long enough to ride out a model outage, short enough that an operator reading
-`sweeper_status` sees a bounded number.
+- `retries INTEGER NOT NULL DEFAULT 0` — incremented on **every** transition into `failed`,
+  regardless of classification. No ceiling. It is the backoff exponent and the number an
+  operator reads.
+- `next_retry_at` — `now() + LEAST(INTERVAL '15 minutes' * POWER(2, retries - 1),
+  INTERVAL '24 hours')`. NULL means due now, which is what every pre-existing row already is,
+  so the migration needs no backfill.
+- `failed_slices` returns only rows where `next_retry_at IS NULL OR next_retry_at <= now()`.
+
+So the first retry is one cadence later, the fifth is four hours later, and everything from the
+eighth on is daily. A row that will never succeed stops costing a sweep; a row waiting out an
+outage comes back the moment the outage is shorter than its current interval, with every message
+still in it.
+
+**The cooldown a breaker-aborted cohort needs falls out of this for free.** `rollback_attempt`
+refunds `attempts` only — never `retries`, never `next_retry_at` — so rows the cross-session
+breaker rolled back are still deferred, and cannot trip it again on the next cadence.
+
+**What stays terminal.** Two things, and both are already justified: the deterministic ceiling
+(`max_attempts`, ADR-0002 decision 4 — the model's own output does not parse and will not next
+time), and an emptied range (decision 1 — the messages are gone from `state.db`, so there is no
+work left to lose). Neither is unrecoverable in the strict sense either: `mark_quarantined`'s
+docstring carries the one-statement operator replay, `UPDATE session_extraction SET
+status='failed', ...`.
+
+**Why a counter and not a maximum age.** The backoff schedule is driven by `retries`, not by
+wall-clock age, for the same reason revision 2 gave: an age bound punishes the wrong outage — a
+stack that was down for two days would treat every open slice as ancient on the first boot after
+it, having never retried any of them.
 
 ### 4. Mutual exclusion moves into the CLI
 
@@ -184,7 +232,8 @@ Decisions 1–3 stay regardless. This closes the door; those repair what already
   the messages above it either.
 - The ceiling becomes real for the case it was written for, because the key it counts on stops
   moving.
-- Every path into `failed` now has a way out.
+- Every path into `failed` now has a way out, and for the two thirds of them that are not the
+  model's fault the way out is a slower schedule rather than a deleted conversation.
 - No schema change beyond one more `ADD COLUMN IF NOT EXISTS`.
 
 ### Negative
@@ -194,6 +243,9 @@ Decisions 1–3 stay regardless. This closes the door; those repair what already
   arithmetic that revision 1 needed.
 - `retries` and `attempts` are two counters that a reader must not confuse. Their column comments
   say which is which and why they cannot be one.
+- A slice stuck behind a permanent infrastructure fault is never retired automatically. It backs
+  off to daily and waits for an operator. That is the deliberate direction to fail in, but it
+  does mean `sweeper_status` is now the thing that has to be read.
 - Messages 1–10 in the hole case are extracted with less following context than they would have
   had; `context_tail` is a *preceding* window. A retry sees the conversation as it stood, which
   is what the original claim saw too.
@@ -210,8 +262,10 @@ Decisions 1–3 stay regardless. This closes the door; those repair what already
 
 ## Implementation Notes
 
-- `scripts/session_store.py`: `watermarks()` → frontier; new `failed_slices(conn)`; `retries`
-  column plus its increment in `mark_failed` and `expire_stale_claims`; the ceiling check.
+- `scripts/session_store.py`: `watermarks()` → frontier; new `failed_slices(conn)` with the
+  due-ness filter; new `slice_status(conn, session_id, last_message_id)`; `retries` and
+  `next_retry_at` columns, set in BOTH `mark_failed` and `_EXPIRE_STALE_SQL` — the stale-claim
+  path is bulk SQL, so the backoff has to be computed in the UPDATE, not in Python.
 - `icarus/hermes_state.py`: `read_slice_range(con, session_id, *, first_id, last_id)`.
 - `scripts/session_sweeper.py`: the retry pass ahead of the fresh pass; the empty-range
   quarantine; the CLI lock.
@@ -221,8 +275,9 @@ Decisions 1–3 stay regardless. This closes the door; those repair what already
 - Proven against a real PostgreSQL, not the fakes: a `failed` row below a `published` one is
   offered at its own range and closes; a `failed` row with a growing tail does not double-claim
   with the fresh path; `attempts` accumulates across retries on the same row; three deterministic
-  failures quarantine it and the frontier is unaffected; 20 transient failures quarantine it too;
-  an emptied range quarantines on the first retry.
+  failures quarantine it and the frontier is unaffected; twenty transient failures back it off and
+  never quarantine it; an emptied range quarantines on the first retry; and two poison retry rows
+  in different sessions do not stop an unrelated fresh candidate from being extracted.
 
 ## Related
 
