@@ -509,3 +509,115 @@ def test_a_row_rescheduled_between_selection_and_claim_is_not_reclaimed(conn):
     assert session_store.slice_status(conn, "s", 10) == "failed"        # status says go
     assert session_store.claim(conn, session_id="s", first_message_id=1,
                                last_message_id=10, message_count=10) is False
+
+
+def _age_claim(conn, session_id, last_message_id, *, hours):
+    """Backdate a claimed row so `expire_stale_claims` sees it as abandoned.
+
+    Staleness is wall-clock, tested inside the bulk UPDATE, so a test that
+    wants a stale row says so directly rather than sleeping for one.
+    """
+    with conn.cursor() as cur:
+        cur.execute("UPDATE session_extraction "
+                    "SET updated_at = now() - make_interval(hours => %s) "
+                    "WHERE session_id = %s AND last_message_id = %s",
+                    (hours, session_id, last_message_id))
+    conn.commit()
+
+
+def test_a_hole_closes_at_its_own_range(conn):
+    """(s,1..10) failed under (s,11..20) published. The RECLAIM arm must fire on
+    the failed row's own key — the fresh path can never reach it."""
+    from scripts import session_store
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    session_store.mark_failed(conn, session_id="s", last_message_id=10, error="x")
+    session_store.claim(conn, session_id="s", first_message_id=11,
+                        last_message_id=20, message_count=10)
+    session_store.mark_published(conn, session_id="s", last_message_id=20, jobs=[])
+    _make_due(conn, "s", 10)
+    owed = session_store.failed_slices(conn)
+    assert [(r["first_message_id"], r["last_message_id"]) for r in owed] == [(1, 10)]
+    assert session_store.claim(conn, session_id="s", first_message_id=1,
+                               last_message_id=10, message_count=10) is True
+    session_store.mark_published(conn, session_id="s", last_message_id=10, jobs=[])
+    assert session_store.slice_status(conn, "s", 10) == "published"
+
+
+def test_the_frontier_includes_failed_so_the_fresh_path_starts_above_it(conn):
+    """The double-claim guard. With the OLD rule the frontier here is 0 and the
+    fresh path would build (1..25), overlapping the retry's (1..10) under a key
+    UNIQUE (session_id, last_message_id) cannot see."""
+    from scripts import session_store
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    session_store.mark_failed(conn, session_id="s", last_message_id=10, error="x")
+    assert session_store.watermarks(conn) == {"s": 10}
+
+
+def test_attempts_accumulates_across_retries_on_the_same_row(conn):
+    """_CLAIM_RECLAIM_SQL's DO UPDATE sets status and timestamps only, so the
+    counter survives the reclaim. This is what #15 was missing: the key stops
+    moving, so there is a counter to accumulate on.
+
+    The `_make_due` before each re-claim is not decoration. Without it the
+    reclaim arm's due-ness condition rejects every one of these claims (they
+    return False, silently), `mark_failed` increments anyway because it is a
+    keyed UPDATE that does not read `status`, and the test passes while proving
+    nothing about the reclaim — the exact shape the plan's version had.
+    """
+    from scripts import session_store
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    for expected in (1, 2, 3):
+        attempts, _ = session_store.mark_failed(conn, session_id="s", last_message_id=10,
+                                                error="unparseable", count_attempt=True)
+        assert attempts == expected
+        _make_due(conn, "s", 10)
+        assert session_store.claim(conn, session_id="s", first_message_id=1,
+                                   last_message_id=10, message_count=10) is True
+
+
+def test_three_deterministic_failures_quarantine_and_the_frontier_is_unmoved(conn):
+    """ADR-0003's own named risk: with the frontier, a failed row consumes the
+    watermark, so if the retry path ever regresses these messages are
+    unreachable from BOTH passes. Write this one first."""
+    from scripts import session_store
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    for _ in range(3):
+        session_store.mark_failed(conn, session_id="s", last_message_id=10,
+                                  error="unparseable", count_attempt=True)
+        session_store.claim(conn, session_id="s", first_message_id=1,
+                            last_message_id=10, message_count=10)
+    session_store.mark_quarantined(conn, session_id="s", last_message_id=10, error="ceiling")
+    assert session_store.watermarks(conn) == {"s": 10}
+    assert session_store.failed_slices(conn) == []
+
+
+def test_forty_transient_failures_never_quarantine_and_stay_recoverable(conn):
+    """The counter has no ceiling by design. After forty failures the row is
+    still 'failed', still carries its range, and comes back the moment its
+    backoff elapses."""
+    from scripts import session_store
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    for _ in range(40):
+        session_store.mark_failed(conn, session_id="s", last_message_id=10, error="timeout")
+    assert session_store.slice_status(conn, "s", 10) == "failed"
+    _make_due(conn, "s", 10)
+    assert [(r["first_message_id"], r["last_message_id"])
+            for r in session_store.failed_slices(conn)] == [(1, 10)]
+
+
+def test_a_stale_claim_is_rescheduled_not_retried_immediately(conn):
+    """expire_stale_claims is bulk SQL, so its backoff is computed in the
+    UPDATE. If it is not, a slice that crashes the process every time comes
+    back every single cadence forever."""
+    from scripts import session_store
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    _age_claim(conn, "s", 10, hours=3)
+    assert session_store.expire_stale_claims(conn) == 1
+    assert session_store.slice_status(conn, "s", 10) == "failed"
+    assert session_store.failed_slices(conn) == []      # scheduled, not due
