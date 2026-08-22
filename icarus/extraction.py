@@ -295,7 +295,18 @@ def score_exchanges(exchanges, *, recall_usage: float | None = None,
     # is not a conversation that reached a decision; it is someone saying they
     # made one. Caught by a test, not by the corpus -- none of the reference
     # host's 14 short sessions happened to contain a decision word.
-    if substantive or substantial_user:
+    #
+    # THE `or substantial_user` HALF WAS STILL A HOLE, closed 2026-08-22 after
+    # the fleet review: `{"user": "x"*51, "assistant": "fixed"}` satisfied it
+    # through the USER side and scored 0.31 -- over the threshold for an
+    # exchange with nothing in the answer to extract. `all_text` below is
+    # assistant-only, so the component was reading one side of the exchange
+    # and being gated on the other. A decision is something the assistant
+    # reached; a long question that got a two-word reply is a question,
+    # whatever verb the reply happens to contain. `user_engagement` alone now
+    # tops out at 1/6 = 0.17 and cannot cross 0.2 on its own, which is the
+    # intended shape: a slice with no substantive answer has nothing to store.
+    if substantive:
         all_text = " ".join((e.get("assistant") or "") for e in exchanges)
         has_decision = bool(DECISION_RE.search(all_text))
         has_outcome = bool(OUTCOME_RE.search(all_text))

@@ -122,3 +122,28 @@ def test_two_message_chatter_still_fails_after_the_rescale():
     or fewer stays at 0.07 or below."""
     for text in ("cześć", "dzięki", "ok, naprawiłem"):
         assert extraction.score_exchanges([{"user": text, "assistant": text}])["total"] < 0.2
+
+
+def test_a_long_question_with_a_two_word_answer_does_not_buy_the_threshold():
+    """The OR in the decision gate was the hole the second review found.
+
+    `decision` is the heaviest component (3 of the 6 live weight points once
+    the two unmeasurable ones abstain), and it fired whenever the slice had
+    substance of EITHER kind. So a 51-character question answered with
+    "fixed" scored 0.31 -- over the 0.2 threshold, for an exchange with no
+    assistant content to extract anything from. Measured 2026-08-22 before the
+    fix: {'depth': 0.0, 'decision': 0.5, 'user_engagement': 0.33,
+    'total': 0.31}; "fixed because" reached 0.56.
+
+    A decision is something the ASSISTANT reached. A long question that got a
+    two-word reply is a question, whatever verb the reply happens to contain.
+    """
+    assert extraction.score_exchanges([{"user": "x" * 51, "assistant": "fixed"}])["total"] < 0.2
+    assert extraction.score_exchanges(
+        [{"user": "x" * 51, "assistant": "fixed because"}])["total"] < 0.2
+
+
+def test_a_substantive_answer_still_scores_its_decision():
+    """The gate narrows to `substantive`; it must not close on real work."""
+    ex = [{"user": "x" * 51, "assistant": "Naprawiłem to, ponieważ " + "d" * 200}]
+    assert extraction.score_exchanges(ex)["decision"] == 1.0
