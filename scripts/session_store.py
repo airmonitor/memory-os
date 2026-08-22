@@ -61,6 +61,13 @@ logger = logging.getLogger(__name__)
 
 STALE_CLAIM_HOURS = 2
 
+# 15 min, doubling, capped at a day: the first retry is one cron cadence later,
+# the fifth is four hours later, the eighth and everything after is daily. Long
+# enough that a hopeless row stops costing a sweep; short enough that a row
+# waiting out an outage comes back as soon as the outage is over.
+RETRY_BACKOFF_BASE = "15 minutes"
+RETRY_BACKOFF_CAP = "24 hours"
+
 SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS session_extraction (
@@ -106,6 +113,36 @@ SCHEMA = (
     """
     ALTER TABLE session_extraction
         ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0
+    """,
+    # `attempts` (above) counts only classified-deterministic failures, which
+    # is right — an outage must not spend the budget that exists for content
+    # the model cannot parse. But that left THREE producers of 'failed' with no
+    # exit at all: expire_stale_claims, a transient ExtractionFailed, and the
+    # generic `except Exception`. All three call mark_failed(count_attempt=
+    # False). Before ADR-0003 they were harmless because the next sweep
+    # re-derived a fresh slice with a new key; now that a failed row is retried
+    # AT ITS OWN RANGE, the same row comes back forever. This counter is the
+    # bound for those three, and it counts every transition into 'failed'
+    # regardless of classification. NOT a maximum age: a stack that was down
+    # for two days would quarantine every open slice on the first boot after
+    # it, having never retried any of them (ADR-0003 decision 3).
+    """
+    ALTER TABLE session_extraction
+        ADD COLUMN IF NOT EXISTS retries INTEGER NOT NULL DEFAULT 0
+    """,
+    # WHAT BOUNDS THOSE THREE, and it is not a ceiling. Revision 2 of ADR-0003
+    # proposed retiring a row after 20 retries; review killed it, correctly: a
+    # 'quarantined' row still counts toward the frontier while the retry pass
+    # reads only 'failed' rows, so quarantining is precisely how messages
+    # become unreachable from BOTH passes. A five-hour gateway outage would
+    # have permanently discarded every slice it touched. What actually needs
+    # bounding is the RATE, not the count — so the row is rescheduled instead.
+    #
+    # NULL means due now, which is what every row that predates this column
+    # already is: no backfill (ADR-0003 decision 3).
+    """
+    ALTER TABLE session_extraction
+        ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ
     """,
     """
     ALTER TABLE sweeper_status
@@ -218,9 +255,25 @@ _CLAIM_RECLAIM_SQL = f"""
 """
 
 
+# BULK SQL over every stale row at once, which is exactly why the backoff is
+# computed in the UPDATE and not in Python — there is no per-row Python pass
+# here to compute it in. The two clauses are identical to _MARK_FAILED_SQL's,
+# inner LEAST included; that comment explains why the exponent cap is not
+# redundant, and this statement is the reason its blast radius is a whole
+# sweep rather than a single row.
 _EXPIRE_STALE_SQL = """
     UPDATE session_extraction
-       SET status = 'failed', error = 'stale claim expired', updated_at = now()
+       SET status = 'failed', error = 'stale claim expired', updated_at = now(),
+           -- A stale claim is a failure like any other from this counter's point
+           -- of view: the slice was taken and no answer came back. Not counting it
+           -- here would let a slice that crashes the process every single time
+           -- retry every cadence forever, which is the shape ADR-0003 decision 3
+           -- bounds. It is rescheduled, never retired: the process crashing is not
+           -- evidence about the conversation.
+           retries = session_extraction.retries + 1,
+           next_retry_at = now() + LEAST(
+               INTERVAL '15 minutes' * POWER(2, LEAST(session_extraction.retries, 7)),
+               INTERVAL '24 hours')
      WHERE status = 'claimed'
        AND updated_at < now() - make_interval(hours => %s)
 """
@@ -314,18 +367,43 @@ def mark_published(conn, *, session_id, last_message_id, jobs) -> None:
             "status = 'published', jobs = %s", (json.dumps(list(jobs)),))
 
 
+# Two things about the backoff expression are load-bearing and neither is
+# obvious:
+#
+# 1. `session_extraction.retries` on the right-hand side is the value BEFORE
+#    this statement's increment, so the first failure schedules 15 minutes out
+#    (2^0) and the second 30 (2^1). Off by one and every row waits double from
+#    the start.
+# 2. THE INNER LEAST(…, 7) IS NOT REDUNDANT WITH THE OUTER ONE, and the blast
+#    radius is larger than one row. `_EXPIRE_STALE_SQL` carries the same
+#    expression over EVERY stale row in one statement, so a single row that has
+#    aged past the overflow point aborts the whole top-of-sweep expiry — and
+#    `expire_stale_claims` running is what makes abandoned rows visible to
+#    `find_candidates` at all. One poison row would stop every sweep. The outer
+#    LEAST applies to the RESULT of the multiplication, so an uncapped exponent
+#    overflows the interval type before the cap can help. Measured on
+#    PostgreSQL 17, 2026-08-22: POWER(2, 40) there raises `ERROR: interval out
+#    of range` — inside `mark_failed`, which means a slice that has failed
+#    forty times can no longer be recorded as failed at all. Verified schedule
+#    with the inner cap: 15m, 30m, 1h, 2h, 4h, 8h, 16h, 24h, 24h, 24h for
+#    retries = 0..9.
 _MARK_FAILED_SQL = """
     UPDATE session_extraction
        SET status = 'failed', error = %s,
            attempts = attempts + CASE WHEN %s THEN 1 ELSE 0 END,
+           retries = session_extraction.retries + 1,
+           next_retry_at = now() + LEAST(
+               INTERVAL '15 minutes' * POWER(2, LEAST(session_extraction.retries, 7)),
+               INTERVAL '24 hours'),
            updated_at = now()
      WHERE session_id = %s AND last_message_id = %s
-    RETURNING attempts
+    RETURNING attempts, retries
 """
 
 
-def mark_failed(conn, *, session_id, last_message_id, error, count_attempt=False) -> int:
-    """Mark a slice retryable and return its `attempts` count after this call.
+def mark_failed(conn, *, session_id, last_message_id, error,
+                count_attempt=False) -> tuple[int, int]:
+    """Mark a slice retryable and return its counters after this call.
 
     `count_attempt` is the classification decision itself (ADR-0002 decision
     4): a transient failure (connection error, timeout, HTTP status error, a
@@ -336,13 +414,19 @@ def mark_failed(conn, *, session_id, last_message_id, error, count_attempt=False
     validate) calls this with `count_attempt=True`, and the caller compares
     the returned value against `session_extraction.max_attempts` to decide
     whether to quarantine instead.
+
+    Returns `(attempts, retries)`. `attempts` is the classification decision
+    (ADR-0002 decision 4); `retries` is every failure this row has ever had and
+    is what bounds the three producers `attempts` deliberately does not count
+    (ADR-0003 decision 3). `attempts` has a ceiling and quarantines; `retries`
+    has none and never does — it only drives `next_retry_at`.
     """
     with conn.cursor() as cur:
         cur.execute(_MARK_FAILED_SQL,
                     (str(error)[:2000], count_attempt, session_id, last_message_id))
         row = cur.fetchone()
     conn.commit()
-    return int(row[0]) if row else 0
+    return (int(row[0]), int(row[1])) if row else (0, 0)
 
 
 def mark_quarantined(conn, *, session_id, last_message_id, error) -> None:

@@ -117,7 +117,7 @@ def test_a_stale_claim_with_a_prior_failure_keeps_its_attempts_count(conn):
     session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
                         message_count=4)
     assert session_store.mark_failed(conn, session_id=sid, last_message_id=9,
-                                     error="bad json", count_attempt=True) == 1
+                                     error="bad json", count_attempt=True) == (1, 1)
     # Reclaim the now-'failed' row via claim()'s 'failed' reclaim arm, so the
     # row goes back to 'claimed' with attempts == 1 before it goes stale below.
     assert session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
@@ -271,17 +271,19 @@ def test_mark_failed_returns_the_incremented_attempts_count(conn):
     sid = f"s-{uuid.uuid4()}"
     session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
                         message_count=4)
+    # (attempts, retries) since ADR-0003 decision 3. `retries` moves on every
+    # one of these three calls; `attempts` only on the two deterministic ones.
     assert session_store.mark_failed(conn, session_id=sid, last_message_id=9,
-                                     error="bad json", count_attempt=True) == 1
+                                     error="bad json", count_attempt=True) == (1, 1)
     # A transient failure must not move the counter at all.
     assert session_store.mark_failed(conn, session_id=sid, last_message_id=9,
-                                     error="gateway timeout", count_attempt=False) == 1
+                                     error="gateway timeout", count_attempt=False) == (1, 2)
     # The row is 'failed' after mark_failed, so claim()'s reclaim arm re-wins it
     # without touching attempts - only mark_failed(count_attempt=True) does.
     session_store.claim(conn, session_id=sid, first_message_id=1, last_message_id=9,
                         message_count=4)
     assert session_store.mark_failed(conn, session_id=sid, last_message_id=9,
-                                     error="bad json again", count_attempt=True) == 2
+                                     error="bad json again", count_attempt=True) == (2, 3)
 
 
 def test_rollback_attempt_decrements_without_going_below_zero(conn):
@@ -361,3 +363,58 @@ def test_the_production_lock_sequence_holds_across_watermarks_and_releases_at_cl
     finally:
         other.rollback()
         other.close()
+
+
+def _next_retry_at(conn, session_id, last_message_id):
+    """The backoff clock as the server wrote it. Read back rather than
+    computed, because the clock is the server's, not this process's."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT next_retry_at FROM session_extraction "
+                    "WHERE session_id = %s AND last_message_id = %s",
+                    (session_id, last_message_id))
+        return cur.fetchone()[0]
+
+
+def test_retries_counts_every_failure_and_attempts_only_deterministic(conn):
+    from scripts import session_store
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    a, r = session_store.mark_failed(conn, session_id="s", last_message_id=10,
+                                     error="timeout", count_attempt=False)
+    assert (a, r) == (0, 1)
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    a, r = session_store.mark_failed(conn, session_id="s", last_message_id=10,
+                                     error="unparseable", count_attempt=True)
+    assert (a, r) == (1, 2)
+
+
+def test_each_failure_pushes_next_retry_at_further_out(conn):
+    from scripts import session_store
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    session_store.mark_failed(conn, session_id="s", last_message_id=10, error="x")
+    first = _next_retry_at(conn, "s", 10)
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    session_store.mark_failed(conn, session_id="s", last_message_id=10, error="x")
+    second = _next_retry_at(conn, "s", 10)
+    # 15 min then 30 min, so the gap roughly doubles. Compared against each
+    # other rather than against a literal: the clock is the server's.
+    assert (second - first).total_seconds() > 12 * 60
+
+
+def test_the_backoff_survives_a_row_that_failed_forty_times(conn):
+    """Not just 'is it capped'. LEAST applies to the RESULT of the
+    multiplication, so an uncapped POWER(2, retries) raises 'interval out of
+    range' INSIDE mark_failed — measured at retries=40 on PostgreSQL 17. A row
+    that has failed forty times would stop being recordable as failed."""
+    from scripts import session_store
+    session_store.claim(conn, session_id="s", first_message_id=1,
+                        last_message_id=10, message_count=10)
+    for _ in range(40):
+        session_store.mark_failed(conn, session_id="s", last_message_id=10, error="x")
+    with conn.cursor() as cur:
+        cur.execute("SELECT next_retry_at - now() < interval '25 hours' "
+                    "FROM session_extraction WHERE session_id='s' AND last_message_id=10")
+        assert cur.fetchone()[0] is True

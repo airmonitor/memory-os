@@ -28,6 +28,10 @@ class FakePg:
         # accumulated. Independent of `claimed` (status), the way the real
         # `attempts` column is independent of `status`.
         self.attempts = {}
+        # ADR-0003 decision 3: how many times each row has entered 'failed' AT
+        # ALL, whatever the classification. Two counters, never one — this is
+        # the one with no ceiling, and it is what drives the backoff clock.
+        self.retries = {}
 
     def ensure_schema(self): self.calls.append("ensure_schema")
 
@@ -39,6 +43,10 @@ class FakePg:
         for key, status in list(self.claimed.items()):
             if status == "claimed" and key in self.stale:
                 self.claimed[key] = "failed"
+                # _EXPIRE_STALE_SQL bumps `retries` too, and mirroring that
+                # here is the point of a fake: a stale claim is a failure like
+                # any other from that counter's point of view.
+                self.retries[key] = self.retries.get(key, 0) + 1
                 self.stale.discard(key)
                 self.marks.append(("expired", {"session_id": key[0],
                                                "last_message_id": key[1]}))
@@ -74,8 +82,11 @@ class FakePg:
         self.claimed[key] = "failed"
         if kw.get("count_attempt"):
             self.attempts[key] = self.attempts.get(key, 0) + 1
+        # Every transition into 'failed', unconditionally — the real column is
+        # incremented outside the CASE WHEN that guards `attempts`.
+        self.retries[key] = self.retries.get(key, 0) + 1
         self.marks.append(("failed", kw))
-        return self.attempts.get(key, 0)
+        return (self.attempts.get(key, 0), self.retries[key])
 
     def mark_quarantined(self, **kw):
         self.claimed[(kw["session_id"], kw["last_message_id"])] = "quarantined"

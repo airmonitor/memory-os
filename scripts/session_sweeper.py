@@ -347,8 +347,9 @@ def sweep(deps: Deps, cfg: dict) -> dict:
             logger.warning("slice %s:%s failed deterministically during extraction: %s",
                            cand.session_id, last_id, exc)
             transient_streak = 0
-            attempts = deps.pg.mark_failed(session_id=cand.session_id, last_message_id=last_id,
-                                           error=exc, count_attempt=True)
+            attempts, retries = deps.pg.mark_failed(
+                session_id=cand.session_id, last_message_id=last_id,
+                error=exc, count_attempt=True)
             det_rows.append((cand.session_id, last_id))
             det_sessions.add(cand.session_id)
             if len(det_sessions) >= cfg["deterministic_sessions_abort"]:
@@ -572,8 +573,14 @@ def _dry_run_stubs(deps: Deps, pg: _PgAdapter) -> None:
         "[dry-run] would mark_extracted %s:%s", kw.get("session_id"), kw.get("last_message_id"))
     pg.mark_published = lambda **kw: logger.info(
         "[dry-run] would mark_published %s:%s", kw.get("session_id"), kw.get("last_message_id"))
+    # `(0, 0)`, not `0`: mark_failed returns (attempts, retries) since ADR-0003
+    # decision 3, and the deterministic branch UNPACKS it. A stub still handing
+    # back a bare int would make `--dry-run` — the one mode whose entire job is
+    # to never write and never raise — die with `TypeError: cannot unpack
+    # non-iterable int object` the first time a dry run hit a bad slice.
     pg.mark_failed = lambda **kw: logger.info(
-        "[dry-run] would mark_failed %s:%s", kw.get("session_id"), kw.get("last_message_id")) or 0
+        "[dry-run] would mark_failed %s:%s",
+        kw.get("session_id"), kw.get("last_message_id")) or (0, 0)
     pg.mark_quarantined = lambda **kw: logger.info(
         "[dry-run] would mark_quarantined %s:%s", kw.get("session_id"), kw.get("last_message_id"))
     pg.rollback_attempt = lambda **kw: logger.info(
