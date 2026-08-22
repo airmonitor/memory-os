@@ -630,3 +630,17 @@ def test_a_compacted_row_is_warned_about_once_per_run(hermes_db, caplog):
         sw.sweep(deps, CFG)
     hits = [r for r in caplog.records if "COMPACTED-ROWS" in r.getMessage()]
     assert len(hits) == 1
+
+
+def test_write_payload_entry_records_the_sweeper_as_origin():
+    """ADR-0002 decision 1.4: an unwired origin field is worse than no field.
+    `write_payload_entry` is the ONE place `deps.write_entry` is called — both
+    the fresh-publish path (sweep) and the re-dispatch replay go through it —
+    so asserting here covers both call sites at once."""
+    calls = []
+    deps = sw.Deps(sqlite_conn=None, pg=None, extract=None,
+                   write_entry=lambda **kw: calls.append(kw), enqueue=None, now=None)
+    item = {"job_id": "ingest:s:12:0", "text": "c", "entry_type": "decision",
+            "summary": "s", "suffix": "deadbeef"}
+    sw.write_payload_entry(deps, item)
+    assert calls[0]["origin"] == "session-sweeper"

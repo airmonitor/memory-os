@@ -88,7 +88,7 @@ def write_payload_entry(deps: Deps, item: dict) -> bool:
     deps.write_entry(entry_type=item["entry_type"], content=item["text"],
                      summary=item["summary"], platform=item.get("platform") or "cli",
                      training_value=item.get("training_value", "normal"),
-                     status="completed", suffix=item["suffix"])
+                     status="completed", suffix=item["suffix"], origin="session-sweeper")
     return True
 
 

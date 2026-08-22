@@ -305,7 +305,7 @@ def _parse_frontmatter_scalar(text, key):
 def write_entry(entry_type, content, summary, tier="hot", tags="", platform="cli",
                 status="", outcome="", review_of="", revises="", customer_id="",
                 assigned_to="", training_value="", verified="", evidence="",
-                source_tool="", artifact_paths="", suffix=None):
+                source_tool="", artifact_paths="", suffix=None, origin=""):
     """Write a fabric entry with full schema v1 fields. Returns the filepath."""
     FABRIC_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
@@ -365,6 +365,8 @@ def write_entry(entry_type, content, summary, tier="hot", tags="", platform="cli
         lines.append(f"source_tool: {_yaml_scalar(source_tool)}")
     if artifact_paths:
         lines.append(f"artifact_paths: {json.dumps([p.strip() for p in str(artifact_paths).split(',') if p.strip()])}")
+    if origin:
+        lines.append(f"origin: {origin}")
     lines.extend(["---", "", content])
 
     path = FABRIC_DIR / filename
