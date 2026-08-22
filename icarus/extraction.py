@@ -66,14 +66,57 @@ class ExtractionFailed(RuntimeError):
         self.transient = transient
         self.configuration_error = configuration_error
 
+# BOTH LANGUAGES, not one replacing the other: this deployment's corpus is
+# mixed, and the English half is what the fleet's other agents run on.
+#
+# Measured 2026-08-22 on the reference host, which is why the Polish half
+# exists: `decision` carries the heaviest weight of the five (3 of 10) and it
+# scored 0.0 on every single Polish conversation the sweeper had consumed --
+# 26 rows, not one match. A component that cannot fire is not a strict
+# component, it is a fixed tax on the total.
+#
+# Prefix-stemmed rather than fully inflected. Polish verbs inflect for person,
+# number, gender and aspect ("zdecydowałem", "zdecydowaliśmy", "zdecydowano",
+# "zdecydowana"), and enumerating those costs more than it buys against a
+# regex whose only job is "did this conversation reach a decision at all".
 DECISION_RE = re.compile(
-    r"(?i)\b(decided|resolved|completed|fixed|deployed|shipped|reviewed|approved|rejected)\b"
+    r"(?i)(\b(decided|resolved|completed|fixed|deployed|shipped|reviewed|approved|rejected)\b"
+    r"|\b(zdecydowa|postanowi|ustali|ustalono|rozwiąza|napraw|popraw|wdro[żz]|"
+    r"zatwierdz|odrzuc|uko[ńn]cz|zako[ńn]cz|wybrali[śs]my|wybra[łl]em)\w*)"
 )
+# `bo` is deliberately absent. It is the most common Polish causal conjunction
+# and would fire on nearly every transcript; `ponieważ` and `dlatego` carry the
+# same meaning without matching a two-letter substring of ordinary prose.
 OUTCOME_RE = re.compile(
-    r"(?i)(result:|outcome:|conclusion:|because|root cause|instead of|\d+%|\d+x)"
+    r"(?i)(result:|outcome:|conclusion:|because|root cause|instead of|\d+%|\d+x"
+    r"|wynik:|rezultat:|wniosek:|podsumowanie:|ponieważ|dlatego|zamiast"
+    r"|przyczyn\w*|okazało się|w rezultacie)"
 )
+
+# The full set. Which of these actually VOTE is decided per call -- see
+# score_exchanges.
 WEIGHTS = {"depth": 2, "decision": 3, "recall_usage": 2, "linked_entries": 2,
            "user_engagement": 1}
+
+# The two that only an in-process icarus session can measure. Both describe one
+# feature -- the review/revise workflow in icarus/tools.py -- from two sides:
+# `recall_usage` is `usage_rate` from $HERMES_HOME/.icarus-telemetry.jsonl,
+# whose counter is raised only by `state.log_usage(..., action="reviewed"|
+# "revised")`, and `linked_entries` counts fabric entries whose head carries
+# `review_of` or `revises`.
+#
+# NEITHER IS AVAILABLE TO THE SWEEPER, and not because the sweeper forgets to
+# pass them. Measured on the reference host 2026-08-22: the telemetry file does
+# not exist anywhere on the pod's filesystem (`find /`), because
+# `icarus/hooks.py` only calls `log_recall` when a FABRIC recall returned
+# results and the fabric was empty until that day; and the sweeper writes
+# entries with `origin="session-sweeper"`, never `review_of`/`revises`. So a
+# sweeper that dutifully passed them would pass 0.0 and 0.
+#
+# Four of ten weight points that cannot move is a 40% tax on every score the
+# sweeper computes, and with `decision` monolingual it was seven. That is the
+# whole of issue #20.
+_IN_PROCESS_ONLY = ("recall_usage", "linked_entries")
 _TOOL_NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
 
 USER_MAX, ASSISTANT_MAX, TOOL_MAX = 500, 800, 300
@@ -210,22 +253,69 @@ def messages_to_exchanges(messages) -> list[dict]:
     return exchanges
 
 
-def score_exchanges(exchanges, *, recall_usage: float = 0.0, linked_entries: int = 0) -> dict:
+def score_exchanges(exchanges, *, recall_usage: float | None = None,
+                    linked_entries: int | None = None) -> dict:
+    """Score a slice. A component nobody can measure does not get to vote.
+
+    `recall_usage` and `linked_entries` default to None, not to 0.0/0, and the
+    difference is the whole of issue #20. Zero means "measured, and it was
+    zero" -- a real signal that should count against the total. None means
+    "this caller cannot see it", and such a component is dropped from the
+    numerator AND the denominator rather than scored as a failure.
+
+    The sweeper is the caller that cannot see them (see _IN_PROCESS_ONLY), so
+    on its path the total is normalised over 6 weight points instead of 10.
+    Before this, a Polish agentic session could not exceed
+    `(2*depth + 1*user_engagement)/10 = 0.30` against a 0.20 threshold, and
+    an agentic session's depth is pinned at 0.2 by construction: it has one
+    substantive assistant turn (the answer) and dozens of tool calls with empty
+    content. Measured across the reference host's 26 consumed slices, seven
+    scored an identical 0.0733 -- 320 of 548 messages, 58% of the corpus,
+    consumed for zero memories.
+
+    An in-process icarus session that CAN measure them passes them and gets the
+    full five-component score, unchanged.
+    """
     scores = {}
     substantive = [e for e in exchanges if len((e.get("assistant") or "").strip()) > 100]
     scores["depth"] = min(len(substantive) / 5, 1.0)
 
-    all_text = " ".join((e.get("assistant") or "") for e in exchanges)
-    has_decision = bool(DECISION_RE.search(all_text))
-    has_outcome = bool(OUTCOME_RE.search(all_text))
-    scores["decision"] = 1.0 if (has_decision and has_outcome) else (0.5 if has_decision else 0.0)
-    scores["recall_usage"] = float(recall_usage)
-    scores["linked_entries"] = min(linked_entries / 2, 1.0)
     substantial_user = sum(1 for e in exchanges if len((e.get("user") or "").strip()) > 50)
+
+    # DECISION IS A MODIFIER ON SUBSTANCE, NOT SUBSTANCE ITSELF. It is the
+    # heaviest single component (3 of 10 raw, 3 of 6 once the two unmeasurable
+    # ones abstain), so on its own it can carry a slice that has nothing in it:
+    # "ok, naprawiłem" scores depth 0, engagement 0, decision 0.5 -> 1.5/6 =
+    # 0.25, over the 0.2 threshold, for two words and an LLM call that would
+    # find nothing to extract. Under the old denominator the same slice landed
+    # at 0.15 and failed, so the rescale would have quietly bought the
+    # threshold's job.
+    #
+    # A slice with no substantive assistant turn AND no substantial user turn
+    # is not a conversation that reached a decision; it is someone saying they
+    # made one. Caught by a test, not by the corpus -- none of the reference
+    # host's 14 short sessions happened to contain a decision word.
+    if substantive or substantial_user:
+        all_text = " ".join((e.get("assistant") or "") for e in exchanges)
+        has_decision = bool(DECISION_RE.search(all_text))
+        has_outcome = bool(OUTCOME_RE.search(all_text))
+        scores["decision"] = 1.0 if (has_decision and has_outcome) else (0.5 if has_decision else 0.0)
+    else:
+        scores["decision"] = 0.0
+    if recall_usage is not None:
+        scores["recall_usage"] = float(recall_usage)
+    if linked_entries is not None:
+        scores["linked_entries"] = min(linked_entries / 2, 1.0)
     scores["user_engagement"] = min(substantial_user / 3, 1.0)
 
+    # Only over the components this call actually produced. Iterating WEIGHTS
+    # and reading scores[k] would KeyError the moment a component is absent,
+    # which is the safe direction -- but the denominator has to shrink with the
+    # numerator or dropping a component would be indistinguishable from scoring
+    # it zero, which is the bug this replaces.
+    live = {k: w for k, w in WEIGHTS.items() if k in scores}
     scores["total"] = round(
-        sum(scores[k] * WEIGHTS[k] for k in WEIGHTS) / sum(WEIGHTS.values()), 2)
+        sum(scores[k] * live[k] for k in live) / sum(live.values()), 2)
     return scores
 
 
