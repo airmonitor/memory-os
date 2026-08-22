@@ -51,13 +51,58 @@ def entry_suffix(session_id: str, last_message_id: int, index: int) -> str:
     return hashlib.sha256(raw).hexdigest()[:8]
 
 
+def payload_item(session_id: str, last_message_id: int, index: int, entry: dict,
+                 platform: str) -> dict:
+    """What `mark_extracted` stores per entry — BOTH halves of the publish.
+
+    `text` and `job_id` are what the ARQ dispatch needs. The rest is what the
+    fabric WRITE needs, and it is stored for exactly the same reason: a retry
+    has to be able to redo both. When the payload carried only the dispatch
+    half, a `write_entry` failure ended with the next sweep's `redispatch()`
+    enqueuing the memory into Qdrant while the file it describes was never
+    written — the one asymmetry this ordering exists to prevent.
+    """
+    return {
+        "job_id": job_id(session_id, last_message_id, index),
+        "text": entry["content"],
+        "entry_type": entry["type"],
+        "summary": entry["summary"],
+        "training_value": entry.get("training_value", "normal"),
+        "platform": platform,
+        "suffix": entry_suffix(session_id, last_message_id, index),
+    }
+
+
+def write_payload_entry(deps: Deps, item: dict) -> bool:
+    """Write one fabric file from a stored payload item.
+
+    False means the item predates the enriched shape above — a row an older
+    sweeper left at 'extracted', carrying only `job_id`/`text`. Those are
+    dispatch-only by construction and must not be treated as an error, or a
+    single legacy row would block its own drain forever.
+    """
+    if "entry_type" not in item:
+        logger.info("payload item %s predates the fabric fields — dispatch only",
+                    item.get("job_id"))
+        return False
+    deps.write_entry(entry_type=item["entry_type"], content=item["text"],
+                     summary=item["summary"], platform=item.get("platform") or "cli",
+                     training_value=item.get("training_value", "normal"),
+                     status="completed", suffix=item["suffix"])
+    return True
+
+
 def redispatch(deps: Deps) -> int:
-    """Send jobs for slices that were extracted but never dispatched.
+    """Finish slices that were extracted but never published.
 
     This is the other half of the ordering guarantee. Publishing before
     dispatching means a broker outage cannot lose an entry — but only if
     something comes back for it. The payload was stored with the claim, so this
     costs no LLM call.
+
+    Files first, then jobs, in that order and for the same reason as the fresh
+    path: whatever failed the first time, this must never leave a memory in
+    Qdrant whose fabric entry does not exist on disk.
     """
     sent = 0
     for row in deps.pg.pending_dispatch():
@@ -67,6 +112,8 @@ def redispatch(deps: Deps) -> int:
         # candidate selection even begins — an uncaught raise here would abort
         # the whole sweep, not just this one pending row.
         try:
+            for item in row["payload"]:
+                write_payload_entry(deps, item)
             for item in row["payload"]:
                 deps.enqueue("process_ingestion", item["text"], "session",
                              job_id=item["job_id"])
@@ -84,9 +131,32 @@ def redispatch(deps: Deps) -> int:
 def sweep(deps: Deps, cfg: dict) -> dict:
     now = deps.now()
     deps.pg.ensure_schema()
+
+    # BEFORE watermarks(), and the order is the whole fix. A hard crash leaves a
+    # row at 'claimed'; watermarks() counts it; find_candidates then sees zero
+    # pending messages for that session and skips it — so claim() is never
+    # called with that key and its stale-claim ON CONFLICT branch can never
+    # fire. Expiring here drops the row out of the watermark, which puts the
+    # slice back in front of find_candidates, and claim()'s existing 'failed'
+    # arm re-claims it. Measured before the fix: a stuck 'claimed' row at
+    # (s, 12) with 12 unextracted messages reported `candidates: 0` forever.
+    expired = deps.pg.expire_stale_claims()
+    if expired:
+        logger.warning("expired %d stale claim(s) — slices they held are offered again",
+                       expired)
+
+    live_schema = hermes_state.schema_version(deps.sqlite_conn)
+    if live_schema is not None and live_schema != hermes_state.KNOWN_SCHEMA_VERSION:
+        # ADR-0001 §5: drift is logged, never fatal. Recording the number in the
+        # status row was never the promise on its own — nothing compared it.
+        logger.warning("SCHEMA-DRIFT: state.db schema_version is %s, this sweeper "
+                       "was written against %s — reading it anyway",
+                       live_schema, hermes_state.KNOWN_SCHEMA_VERSION)
+
     stats = {"candidates": 0, "extracted": 0, "entries": 0, "jobs": 0,
              "redispatched": redispatch(deps)}
     marks = deps.pg.watermarks()
+    warned_compacted = False
 
     with hermes_state.snapshot(deps.sqlite_conn):
         candidates = hermes_state.find_candidates(
@@ -104,6 +174,17 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                                                after_id=after)
             if not messages:
                 continue
+            # ADR-0001 §4 promises a warning the first time a compacted row is
+            # met: compaction has never run on this installation (0 rows
+            # measured), so its effect on a slice is unobserved rather than
+            # known-safe. `compacted` was read into Message and then never
+            # looked at, which made the promise a no-op.
+            if not warned_compacted and any(m.compacted for m in messages):
+                warned_compacted = True
+                logger.warning("COMPACTED-ROWS: session %s carries compacted messages; "
+                               "Hermes may have rewritten history before this slice "
+                               "was swept (ADR-0001 §4, unobserved until now)",
+                               cand.session_id)
             context = hermes_state.context_tail(deps.sqlite_conn, cand.session_id,
                                                 before_id=after,
                                                 limit=cfg["context_overlap"]) if after else []
@@ -141,7 +222,8 @@ def sweep(deps: Deps, cfg: dict) -> dict:
                 continue
             entries = deps.extract(extraction.build_transcript(messages, context=context))
             stats["extracted"] += 1
-            payload = [{"job_id": job_id(cand.session_id, last_id, i), "text": e["content"]}
+            platform = cand.source or "cli"
+            payload = [payload_item(cand.session_id, last_id, i, e, platform)
                        for i, e in enumerate(entries)]
             deps.pg.mark_extracted(session_id=cand.session_id, last_message_id=last_id,
                                    entries=len(entries), score=score["total"],
@@ -159,23 +241,28 @@ def sweep(deps: Deps, cfg: dict) -> dict:
         # for a second LLM call. Instead it stays 'extracted', and the next
         # sweep's redispatch() drains it from the stored payload at no
         # further LLM cost.
+        #
+        # Every fabric file for the slice is written FIRST, and only then is any
+        # job enqueued. Interleaving the two meant a write_entry failure on
+        # entry 2 of 3 left entry 1 already in Qdrant's queue, the slice at
+        # 'extracted', and the next sweep replaying the dispatch half against a
+        # file that was never written. Files first makes a write failure
+        # dispatch nothing at all, and the stored payload (see payload_item)
+        # lets the retry redo both halves.
         try:
-            job_ids = []
-            for i, entry in enumerate(entries):
-                deps.write_entry(entry_type=entry["type"], content=entry["content"],
-                                 summary=entry["summary"], platform=cand.source or "cli",
-                                 training_value=entry.get("training_value", "normal"),
-                                 status="completed",
-                                 suffix=entry_suffix(cand.session_id, last_id, i))
+            for item in payload:
+                write_payload_entry(deps, item)
                 stats["entries"] += 1
-                jid = job_id(cand.session_id, last_id, i)
-                deps.enqueue("process_ingestion", entry["content"], "session", job_id=jid)
-                job_ids.append(jid)
+            job_ids = []
+            for item in payload:
+                deps.enqueue("process_ingestion", item["text"], "session",
+                             job_id=item["job_id"])
+                job_ids.append(item["job_id"])
                 stats["jobs"] += 1
             deps.pg.mark_published(session_id=cand.session_id, last_message_id=last_id,
                                    jobs=job_ids)
         except Exception as exc:
-            logger.warning("slice %s:%s failed during dispatch (will retry): %s",
+            logger.warning("slice %s:%s failed during publish/dispatch (will retry): %s",
                            cand.session_id, last_id, exc)
     return stats
 
@@ -183,9 +270,12 @@ def sweep(deps: Deps, cfg: dict) -> dict:
 # ─── CLI ─────────────────────────────────────────────────────────────────
 
 def _load_cfg(cfg_module) -> dict:
-    """Read session_extraction.* from config, or fall back to the ADR
-    defaults. Task 9 adds the config block; until then this makes the CLI
-    runnable on its own."""
+    """Read session_extraction.* from config, or fall back to the ADR defaults.
+
+    The config block exists (`config/services.yaml`, `session_extraction:`), so
+    the fallback is no longer a placeholder — it is what keeps the CLI runnable
+    against a config file written before this key was added, and what keeps the
+    defaults in one readable place next to the ADR that justifies them."""
     se = getattr(cfg_module, "session_extraction", None)
 
     def g(name, default):
@@ -216,6 +306,9 @@ class _PgAdapter:
 
     def watermarks(self):
         return session_store.watermarks(self.conn)
+
+    def expire_stale_claims(self):
+        return session_store.expire_stale_claims(self.conn)
 
     def claim(self, **kw):
         return session_store.claim(self.conn, **kw)
@@ -266,6 +359,9 @@ def _dry_run_stubs(deps: Deps, pg: _PgAdapter) -> None:
     end-of-run status row — goes through a stub; only reads (watermarks,
     pending_dispatch) stay real."""
     pg.ensure_schema = lambda: logger.info("[dry-run] would ensure_schema")
+    # An UPDATE like any other: a dry run must not flip a live 'claimed' row to
+    # 'failed' behind an operator who is only looking.
+    pg.expire_stale_claims = lambda: logger.info("[dry-run] would expire stale claims") or 0
     pg.claim = lambda **kw: True
     pg.mark_extracted = lambda **kw: logger.info(
         "[dry-run] would mark_extracted %s:%s", kw.get("session_id"), kw.get("last_message_id"))
@@ -367,6 +463,7 @@ def main(argv=None) -> dict:
             deps.pg.record_run(
                 candidates=r.get("candidates", 0), extracted=r.get("extracted", 0),
                 entries=r.get("entries", 0), jobs=r.get("jobs", 0),
+                redispatched=r.get("redispatched", 0),
                 schema_version=hermes_state.schema_version(sqlite_conn), error=error)
         except Exception:
             logger.exception("failed to record sweeper_status row")

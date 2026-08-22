@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from icarus import hermes_state as hs
+from icarus import extraction, hermes_state as hs
 from scripts import session_sweeper as sw
 from tests.conftest import SESSION, MSG
 
@@ -20,8 +20,22 @@ class FakePg:
     def __init__(self, claimed=()):
         self.claimed = {k: "published" for k in claimed}
         self.calls, self.marks, self.payloads = [], [], {}
+        # Keys whose 'claimed' row is older than STALE_CLAIM_HOURS. Wall-clock
+        # ageing is what the real UPDATE does; a test says so directly.
+        self.stale = set()
 
     def ensure_schema(self): self.calls.append("ensure_schema")
+
+    def expire_stale_claims(self):
+        expired = 0
+        for key, status in list(self.claimed.items()):
+            if status == "claimed" and key in self.stale:
+                self.claimed[key] = "failed"
+                self.stale.discard(key)
+                self.marks.append(("expired", {"session_id": key[0],
+                                               "last_message_id": key[1]}))
+                expired += 1
+        return expired
 
     def watermarks(self):
         out = {}
@@ -279,6 +293,9 @@ class RaisingPg:
     def watermarks(self):
         return {}
 
+    def expire_stale_claims(self):
+        raise AssertionError("expire_stale_claims must not run under --dry-run")
+
     def claim(self, **kw):
         raise AssertionError("claim must not run under --dry-run")
 
@@ -390,3 +407,226 @@ def test_session_filter_limits_the_sweep_to_one_session(hermes_db):
     assert result["candidates"] == 1
     assert result["extracted"] == 1
     assert jobs == [sw.job_id("s1", last_ids["s1"], 0)]
+
+
+# ── Fix wave, 2026-08-22 ───────────────────────────────────────────────────
+
+def raising_opener(req, timeout=None):
+    raise TimeoutError("the read operation timed out")
+
+
+def real_extract_against(opener):
+    """deps.extract wired to the REAL extract_entries. The pre-existing failure
+    test used a fake that raises, which the real function never did — it caught
+    everything and returned []. Going through the real one is the point."""
+    return lambda transcript: extraction.extract_entries(
+        transcript, base_url="http://x/v1", api_key="k", model="m",
+        max_tokens=10, timeout=5, opener=opener)
+
+
+def test_a_real_extraction_failure_marks_failed_and_the_slice_comes_back(hermes_db):
+    """FIX 1. With extract_entries swallowing its own failures, this slice ended
+    'published' at watermark 12 with sweeper_status.error NULL, and the next
+    sweep saw no candidates — the conversation was consumed unread."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = FakePg()
+    deps, written, jobs = make_deps(path, pg)
+    deps.extract = real_extract_against(raising_opener)
+
+    result = sw.sweep(deps, CFG)
+    assert result["extracted"] == 0 and result["entries"] == 0 and result["jobs"] == 0
+    assert written == [] and jobs == []
+    assert pg.claimed[("s", 12)] == "failed"
+    # 'failed' is excluded from the watermark, which is what re-offers the slice.
+    assert pg.watermarks() == {}
+    failed = [kw for kind, kw in pg.marks if kind == "failed"]
+    assert "timed out" in str(failed[0]["error"])
+
+    deps2, written2, jobs2 = make_deps(path, pg)
+    result2 = sw.sweep(deps2, CFG)
+    assert result2["candidates"] == 1 and result2["extracted"] == 1
+    assert jobs2 == [sw.job_id("s", 12, 0)]
+
+
+def test_a_missing_api_key_does_not_consume_the_backlog(hermes_db):
+    """FIX 1, the second reproduction: with no key at all the old code returned
+    [] for every slice, so a sweep marked three conversations published per run
+    without ever calling the model."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = FakePg()
+    deps, _, _ = make_deps(path, pg)
+    deps.extract = lambda t: extraction.extract_entries(
+        t, base_url="http://x/v1", api_key="", model="m", max_tokens=10,
+        timeout=5, opener=raising_opener)
+    sw.sweep(deps, CFG)
+    assert pg.claimed[("s", 12)] == "failed"
+    assert pg.watermarks() == {}
+
+
+def test_a_stale_claim_is_expired_and_its_slice_extracted_again(hermes_db):
+    """FIX 2. A hard crash between claim and extract leaves the row at
+    'claimed'; watermarks() counts it, find_candidates then sees zero pending
+    messages and skips the session, so claim() is never called with that key
+    and its reclaim branch can never fire. Reproduced before the fix as
+    `candidates: 0` forever."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = FakePg()
+    pg.claimed[("s", 12)] = "claimed"
+    pg.stale.add(("s", 12))
+    assert pg.watermarks() == {"s": 12}, "the stuck row is what hides the slice"
+
+    deps, written, jobs = make_deps(path, pg)
+    result = sw.sweep(deps, CFG)
+    assert result["candidates"] == 1 and result["extracted"] == 1
+    assert pg.claimed[("s", 12)] == "published"
+    assert jobs == [sw.job_id("s", 12, 0)]
+
+
+def test_a_fresh_claim_is_left_alone(hermes_db):
+    """The other half of FIX 2: expiry must not steal a slice a concurrent
+    sweeper is legitimately working on right now."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    pg = FakePg()
+    pg.claimed[("s", 12)] = "claimed"          # not in pg.stale
+    deps, _, jobs = make_deps(hermes_db(sessions=sessions, messages=messages), pg)
+    result = sw.sweep(deps, CFG)
+    assert result["candidates"] == 0 and jobs == []
+    assert pg.claimed[("s", 12)] == "claimed"
+
+
+def two_entries():
+    return [{"type": "decision", "summary": f"s{i}", "content": f"c{i}",
+             "training_value": "high"} for i in range(2)]
+
+
+def test_a_write_entry_failure_dispatches_nothing(hermes_db):
+    """FIX 3. write_entry and enqueue used to interleave, so a failure on the
+    second entry left the first already queued for Qdrant."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    pg = FakePg()
+    deps, _, jobs = make_deps(hermes_db(sessions=sessions, messages=messages), pg,
+                              entries=two_entries())
+    written = []
+
+    def failing_write(**kw):
+        written.append(kw)
+        if len(written) == 2:
+            raise OSError("read-only file system")
+        return "/fabric/x.md"
+    deps.write_entry = failing_write
+
+    result = sw.sweep(deps, CFG)
+    assert jobs == [], "nothing may be dispatched when a fabric write failed"
+    assert result["jobs"] == 0
+    # Still re-runnable: 'extracted', not 'published', and not 'failed' either
+    # (the LLM call succeeded and its payload is banked).
+    assert pg.claimed[("s", 12)] == "extracted"
+
+
+def test_the_next_sweep_writes_the_file_the_failed_write_never_produced(hermes_db):
+    """FIX 3, the half a plain reordering would have missed: the retry path has
+    to redo BOTH halves. When payload carried only job_id+text, redispatch sent
+    the memory to Qdrant and the fabric file stayed missing forever."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    path = hermes_db(sessions=sessions, messages=messages)
+    pg = FakePg()
+    deps, _, _ = make_deps(path, pg, entries=two_entries())
+    attempts = []
+
+    def failing_write(**kw):
+        attempts.append(kw)
+        if len(attempts) == 2:
+            raise OSError("read-only file system")
+        return "/fabric/x.md"
+    deps.write_entry = failing_write
+
+    sw.sweep(deps, CFG)
+    assert pg.claimed[("s", 12)] == "extracted"
+
+    deps2, written2, jobs2 = make_deps(path, pg, entries=two_entries())
+    result2 = sw.sweep(deps2, CFG)
+    assert result2["redispatched"] == 1
+    # Both fabric files, then both jobs — and no second LLM call.
+    assert [w["suffix"] for w in written2] == [sw.entry_suffix("s", 12, 0),
+                                               sw.entry_suffix("s", 12, 1)]
+    assert jobs2 == [sw.job_id("s", 12, 0), sw.job_id("s", 12, 1)]
+    assert result2["extracted"] == 0
+    assert pg.claimed[("s", 12)] == "published"
+
+
+def test_a_legacy_payload_row_still_drains(hermes_db):
+    """Rows an older sweeper left at 'extracted' carry only job_id and text.
+    They are dispatch-only by construction and must not block their own drain."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    pg = FakePg()
+    pg.claimed[("old", 5)] = "extracted"
+    pg.payloads[("old", 5)] = [{"job_id": "ingest:old:5:0", "text": "stale"}]
+    deps, written, jobs = make_deps(hermes_db(sessions=sessions, messages=messages), pg)
+    result = sw.sweep(deps, CFG)
+    assert result["redispatched"] == 1
+    assert "ingest:old:5:0" in jobs
+    assert pg.claimed[("old", 5)] == "published"
+
+
+class _FakePgConn:
+    def close(self):
+        pass
+
+
+def test_redispatched_reaches_the_status_row(hermes_db, monkeypatch):
+    """FIX 7. sweep() computed `redispatched` and main() dropped it: record_run
+    had no such parameter and sweeper_status no such column, so a backlog that
+    never drains was invisible to the one table built to make stalls queryable."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    pg = FakePg()
+    pg.claimed[("old", 5)] = "extracted"
+    pg.payloads[("old", 5)] = [{"job_id": "ingest:old:5:0", "text": "stale"}]
+    deps, _, _ = make_deps(hermes_db(sessions=sessions, messages=messages), pg)
+    monkeypatch.setattr(sw, "build_deps",
+                        lambda **kw: (deps, _FakePgConn(), deps.sqlite_conn, None))
+
+    sw.main([])
+    runs = [kw for kind, kw in pg.marks if kind == "run"]
+    assert runs, "every run must leave a status row"
+    assert runs[-1]["redispatched"] == 1
+    assert runs[-1]["schema_version"] == 26
+
+
+def test_schema_drift_is_warned_about_once_and_does_not_stop_the_sweep(hermes_db, caplog):
+    """FIX 7. schema_version was recorded and never compared."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    path = hermes_db(sessions=sessions, messages=messages, schema_version=99)
+    deps, _, jobs = make_deps(path, FakePg())
+    with caplog.at_level("WARNING"):
+        result = sw.sweep(deps, CFG)
+    drift = [r for r in caplog.records if "SCHEMA-DRIFT" in r.getMessage()]
+    assert len(drift) == 1
+    assert "99" in drift[0].getMessage()
+    assert str(hs.KNOWN_SCHEMA_VERSION) in drift[0].getMessage()
+    assert result["extracted"] == 1, "drift is logged, never fatal"
+
+
+def test_a_compacted_row_is_warned_about_once_per_run(hermes_db, caplog):
+    """FIX 7. `compacted` was read into Message and never inspected, so the
+    ADR's promised warning was a no-op."""
+    now = time.time()
+    sessions, messages = rich_session(now)
+    for m in messages:
+        m["compacted"] = 1
+    deps, _, _ = make_deps(hermes_db(sessions=sessions, messages=messages), FakePg())
+    with caplog.at_level("WARNING"):
+        sw.sweep(deps, CFG)
+    hits = [r for r in caplog.records if "COMPACTED-ROWS" in r.getMessage()]
+    assert len(hits) == 1

@@ -22,6 +22,14 @@ from pathlib import Path
 
 TRANSCRIPT_ROLES = ("user", "assistant", "tool")
 
+# The schema this reader was written against, measured in the running image
+# (hermes_agent 0.20.4). Recording the live value was never enough on its own:
+# ADR-0001 §5 promises drift is *noticed*, and a number written to a status
+# column that nothing compares is not a notice. The sweeper logs one WARNING
+# per run when the live value differs and reads the database anyway — refusing
+# to sweep on an upgrade would be a silent memory outage of a different shape.
+KNOWN_SCHEMA_VERSION = 26
+
 
 @dataclass(frozen=True)
 class Candidate:
