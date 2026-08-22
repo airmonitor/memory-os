@@ -186,6 +186,13 @@ SCHEMA = (
     # resolves as 'published' and is gone from the retry pass forever — so an
     # operator reading entry counts alone would see a repair as nothing
     # happening at all.
+    #
+    # ATTEMPTED, NOT COMPLETED — it increments where a retry wins its claim, so
+    # a retry that then fails transiently still reports `retried=1` with the row
+    # back at 'failed'. That is the useful direction: a completed-only counter
+    # reads zero throughout exactly the outage an operator is trying to see, and
+    # "the retry pass is running and finding work" is the question this column
+    # is asked. Read it against `extracted` and `quarantined`, not alone.
     """
     ALTER TABLE sweeper_status
         ADD COLUMN IF NOT EXISTS retried INTEGER NOT NULL DEFAULT 0
@@ -648,6 +655,7 @@ def record_run(conn, *, candidates, extracted, entries, jobs, schema_version, er
     1), and it is here because a repair can be invisible in every other column:
     a range that extracts cleanly but yields no entries closes the hole as
     'published' with `extracted` counting it and nothing saying it was a hole.
+    It counts retries ATTEMPTED, not repaired — see its SCHEMA comment.
 
     All six keyword arguments default, and that is load-bearing rather than
     tidy: `record_run` has callers that predate each of them (including the

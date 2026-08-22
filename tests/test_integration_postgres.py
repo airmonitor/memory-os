@@ -246,7 +246,12 @@ def test_ensure_schema_upgrades_an_existing_table_missing_the_new_columns(conn):
         cur.execute("SELECT column_name FROM information_schema.columns "
                     "WHERE table_name = 'sweeper_status' AND table_schema = current_schema()")
         ss_cols = {r[0] for r in cur.fetchall()}
-    assert "attempts" in se_cols
+    # `retries` and `next_retry_at` belong on this assertion for the same
+    # reason `attempts` does, and their absence would be worse: an existing
+    # deployment that upgraded without them fails on the first mark_failed
+    # (UndefinedColumn) rather than degrading, so every path into 'failed'
+    # breaks at once on a stack that was working (ADR-0003 decision 3).
+    assert {"attempts", "retries", "next_retry_at"} <= se_cols
     # The circuit-breaker columns are on this list for the same reason as the
     # rest: they arrive by ALTER, never by the CREATE above, so a deployment
     # whose sweeper_status predates them upgrades or the run-level breakers
