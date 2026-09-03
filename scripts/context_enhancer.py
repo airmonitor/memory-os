@@ -239,6 +239,23 @@ print(json.dumps({"indices": sparse.indices.tolist(), "values": sparse.values.to
             input=text,
             capture_output=True, text=True, timeout=15
         )
+        # Check the subprocess BEFORE parsing it. Without this the only symptom
+        # of a broken helper is `json.loads("")` raising "Expecting value: line 1
+        # column 1 (char 0)" — a JSON error for something that never got as far
+        # as producing JSON. That message hid a plain
+        # `ModuleNotFoundError: No module named 'fastembed'` on all eight agent
+        # pods from the k3s migration (2026-08-31) until 2026-09-03: the whole
+        # fleet ran dense-only and the log blamed the parser.
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"helper exited {result.returncode}: "
+                f"{(result.stderr or '').strip().splitlines()[-1] if result.stderr else 'no stderr'}"
+            )
+        if not result.stdout.strip():
+            raise RuntimeError(
+                f"helper wrote nothing to stdout; stderr: "
+                f"{(result.stderr or '').strip()[-200:] or 'empty'}"
+            )
         data = json.loads(result.stdout.strip())
         return data["indices"], data["values"]
     except Exception as e:
