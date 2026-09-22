@@ -27,6 +27,7 @@ for _candidate in (_here.parent, *_here.parents):
         break
 
 from memos_config import config  # noqa: E402
+from json_reply import parse_json_reply  # noqa: E402
 
 logger = logging.getLogger("cognitive-worker.reflection")
 
@@ -85,8 +86,8 @@ async def reflect_on_memories(qdrant: AsyncQdrantClient) -> dict:
 
     try:
         response = await ollama_chat(prompt)
-        reflection_data = json.loads(response)
-    except json.JSONDecodeError:
+        reflection_data = parse_json_reply(response)
+    except ValueError:
         logger.warning("Reflection returned invalid JSON, saving raw")
         reflection_data = {"raw": response}
     except Exception as e:
