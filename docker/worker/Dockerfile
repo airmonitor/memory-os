@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Python deps (worker-specific)
 COPY docker/worker/requirements.txt /tmp/worker-requirements.txt
-RUN pip install --no-cache-dir -r /tmp/worker-requirements.txt
+COPY docker/worker/constraints.txt /tmp/worker-constraints.txt
+RUN pip install --no-cache-dir -r /tmp/worker-requirements.txt -c /tmp/worker-constraints.txt
 
 # Worker source
 COPY docker/worker/ /app/
